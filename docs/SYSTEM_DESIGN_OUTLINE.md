@@ -52,7 +52,7 @@ flowchart TB
   end
   OS -->|publish\norder.confirmed, order.*| RMQ
   RMQ -->|queue: notifications.order| NS
-  RMQ -.->|queue: inventory.update\n(consumer exists; no producer in repo)| PS
+  RMQ -.->|inventory.update - consumer only| PS
 ```
 
 **Notes:**
