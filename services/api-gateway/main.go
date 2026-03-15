@@ -424,6 +424,27 @@ func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
+	// Set timeout on the transport for resilience
+	proxy.Transport = &http.Transport{
+		ResponseHeaderTimeout: 5 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		MaxIdleConnsPerHost:   10,
+	}
+
+	// Handle proxy errors (timeouts, connection failures)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		correlationID := getCorrelationID(r.Context())
+		slog.Error("proxy error",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"target", targetService,
+			"error", err.Error(),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": "upstream service unavailable"})
+	}
+
 	// Modify the Director to forward all headers including Authorization and X-Correlation-ID
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"order-service/internal/resilience"
 )
 
 const serviceName = "order-service"
@@ -31,6 +34,12 @@ var db *sql.DB
 var rabbitConn *amqp.Connection
 var rabbitCh *amqp.Channel
 var productServiceURL string
+var productServiceClient *resilience.ResilientClient
+
+// Bulkhead: limit concurrent saga executions
+const maxConcurrentSagas = 10
+
+var sagaSemaphore = make(chan struct{}, maxConcurrentSagas)
 
 var (
 	httpRequestsTotal = prometheus.NewCounterVec(
@@ -151,6 +160,14 @@ func main() {
 	slog.SetDefault(logger)
 
 	productServiceURL = getEnv("PRODUCT_SERVICE_URL", "http://localhost:8082")
+
+	// Initialize resilient HTTP client for product service
+	productServiceClient = resilience.NewResilientClient(
+		"product-service",
+		5*time.Second, // 5 second timeout
+		resilience.DefaultConfig(),
+		resilience.DefaultRetryConfig(),
+	)
 
 	var err error
 	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_orders?sslmode=disable"))
@@ -330,6 +347,21 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	correlationID := getCorrelationID(ctx)
 	sagaStart := time.Now()
 
+	// Bulkhead: limit concurrent saga executions
+	select {
+	case sagaSemaphore <- struct{}{}:
+		defer func() { <-sagaSemaphore }()
+	case <-ctx.Done():
+		slog.Warn("saga bulkhead full",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"msg", "saga bulkhead full",
+			"concurrent_sagas", maxConcurrentSagas,
+		)
+		http.Error(w, `{"error":"saga execution timed out waiting for capacity"}`, http.StatusServiceUnavailable)
+		return
+	}
+
 	var req CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -507,11 +539,22 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 func getProduct(ctx context.Context, productID string) (*Product, error) {
 	correlationID := getCorrelationID(ctx)
 
-	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/v1/products/%s", productServiceURL, productID), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/v1/products/%s", productServiceURL, productID), nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("X-Correlation-ID", correlationID)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := productServiceClient.Do(ctx, req)
 	if err != nil {
+		if err == resilience.ErrCircuitOpen {
+			slog.Warn("circuit breaker open",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"target", "product-service",
+				"path", req.URL.Path,
+			)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -531,12 +574,27 @@ func updateStock(ctx context.Context, productID string, quantity int) error {
 	correlationID := getCorrelationID(ctx)
 
 	body, _ := json.Marshal(map[string]int{"quantity": quantity})
-	req, _ := http.NewRequestWithContext(ctx, "PATCH", fmt.Sprintf("%s/api/v1/products/%s/stock", productServiceURL, productID), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "PATCH", fmt.Sprintf("%s/api/v1/products/%s/stock", productServiceURL, productID), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Correlation-ID", correlationID)
+	// GetBody allows the request body to be re-read on retries
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := productServiceClient.Do(ctx, req)
 	if err != nil {
+		if err == resilience.ErrCircuitOpen {
+			slog.Warn("circuit breaker open",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"target", "product-service",
+				"path", req.URL.Path,
+			)
+		}
 		return err
 	}
 	defer resp.Body.Close()

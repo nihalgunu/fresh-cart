@@ -221,6 +221,8 @@ func connectMongoDB() {
 
 func startRabbitMQConsumer() {
 	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	queueName := "notifications.order"
+	dlqName := queueName + ".dlq"
 
 	for {
 		conn, err := amqp.Dial(rabbitURL)
@@ -258,8 +260,26 @@ func startRabbitMQConsumer() {
 			continue
 		}
 
-		// Declare queue
-		q, err := ch.QueueDeclare("notifications.order", true, false, false, false, nil)
+		// Declare the Dead Letter Queue first (simple queue, no special args)
+		_, err = ch.QueueDeclare(dlqName, true, false, false, false, nil)
+		if err != nil {
+			slog.Warn("dlq declare failed",
+				"service", serviceName,
+				"queue", dlqName,
+				"error", err.Error(),
+			)
+			ch.Close()
+			conn.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Declare main queue with DLQ arguments
+		args := amqp.Table{
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": dlqName,
+		}
+		q, err := ch.QueueDeclare(queueName, true, false, false, false, args)
 		if err != nil {
 			slog.Warn("queue declare failed",
 				"service", serviceName,
@@ -293,7 +313,8 @@ func startRabbitMQConsumer() {
 			continue
 		}
 
-		msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
+		// Manual ack mode (autoAck = false)
+		msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
 		if err != nil {
 			slog.Warn("consume failed",
 				"service", serviceName,
@@ -305,7 +326,7 @@ func startRabbitMQConsumer() {
 			continue
 		}
 
-		slog.Info("rabbitmq consumer started", "service", serviceName)
+		slog.Info("rabbitmq consumer started", "service", serviceName, "queue", queueName, "dlq", dlqName)
 
 		for msg := range msgs {
 			// Extract correlation ID from AMQP headers
@@ -328,12 +349,16 @@ func startRabbitMQConsumer() {
 				// Fall back to OrderEvent (from saga - order creation)
 				var orderEvent OrderEvent
 				if err := json.Unmarshal(msg.Body, &orderEvent); err != nil {
-					slog.Warn("invalid message",
+					slog.Warn("message sent to DLQ",
 						"service", serviceName,
+						"msg", "message sent to DLQ",
+						"queue", dlqName,
+						"reason", "JSON parse error: "+err.Error(),
 						"correlation_id", correlationID,
 						"routing_key", routingKey,
-						"error", err.Error(),
 					)
+					// Nack without requeue - sends to DLQ
+					msg.Nack(false, false)
 					continue
 				}
 				orderID = orderEvent.ID
@@ -351,11 +376,15 @@ func startRabbitMQConsumer() {
 			// Get message template for this event type
 			messageTemplate, ok := notificationMessages[routingKey]
 			if !ok {
-				slog.Warn("unknown routing key",
+				slog.Warn("message sent to DLQ",
 					"service", serviceName,
+					"msg", "message sent to DLQ",
+					"queue", dlqName,
+					"reason", "unknown routing key: "+routingKey,
 					"correlation_id", correlationID,
-					"routing_key", routingKey,
 				)
+				// Nack without requeue - sends to DLQ
+				msg.Nack(false, false)
 				continue
 			}
 
@@ -378,24 +407,32 @@ func startRabbitMQConsumer() {
 			_, err := notificationsCollection.InsertOne(ctx, notification)
 			cancel()
 			if err != nil {
-				slog.Error("notification store failed",
+				slog.Error("message sent to DLQ",
 					"service", serviceName,
+					"msg", "message sent to DLQ",
+					"queue", dlqName,
+					"reason", "MongoDB error: "+err.Error(),
 					"correlation_id", correlationID,
 					"order_id", orderID,
-					"error", err.Error(),
 				)
-			} else {
-				// Increment notifications sent counter
-				notificationsSentTotal.WithLabelValues(notificationType).Inc()
-
-				slog.Info("notification stored",
-					"service", serviceName,
-					"correlation_id", correlationID,
-					"order_id", orderID,
-					"user_id", userID,
-					"type", notificationType,
-				)
+				// Nack without requeue - sends to DLQ
+				msg.Nack(false, false)
+				continue
 			}
+
+			// Increment notifications sent counter
+			notificationsSentTotal.WithLabelValues(notificationType).Inc()
+
+			slog.Info("notification stored",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"order_id", orderID,
+				"user_id", userID,
+				"type", notificationType,
+			)
+
+			// Successfully processed - acknowledge the message
+			msg.Ack(false)
 		}
 
 		slog.Warn("rabbitmq connection lost, reconnecting", "service", serviceName)

@@ -1,4 +1,4 @@
-.PHONY: build up down logs seed test-e2e clean boot test-all
+.PHONY: build up down logs seed test-e2e clean boot test-all open-grafana
 
 build:
 	docker compose build
@@ -53,3 +53,8 @@ test-e2e:
 
 test-all:
 	@bash scripts/test-all.sh
+
+open-grafana:
+	@echo "Grafana: http://localhost:3000 (admin/admin)"
+	@echo "Prometheus: http://localhost:9090"
+	@echo "Jaeger: http://localhost:16686"

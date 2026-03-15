@@ -1,4 +1,4 @@
-module github.com/nihalgunu/fresh-cart/services/order-service
+module order-service
 
 go 1.23.0
 

@@ -255,6 +255,8 @@ func migrate() {
 
 func startRabbitMQConsumer() {
 	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+	queueName := "inventory.update"
+	dlqName := queueName + ".dlq"
 
 	for {
 		conn, err := amqp.Dial(rabbitURL)
@@ -279,7 +281,26 @@ func startRabbitMQConsumer() {
 			continue
 		}
 
-		q, err := ch.QueueDeclare("inventory.update", true, false, false, false, nil)
+		// Declare the Dead Letter Queue first (simple queue, no special args)
+		_, err = ch.QueueDeclare(dlqName, true, false, false, false, nil)
+		if err != nil {
+			slog.Warn("dlq declare failed",
+				"service", serviceName,
+				"queue", dlqName,
+				"error", err.Error(),
+			)
+			ch.Close()
+			conn.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Declare main queue with DLQ arguments
+		args := amqp.Table{
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": dlqName,
+		}
+		q, err := ch.QueueDeclare(queueName, true, false, false, false, args)
 		if err != nil {
 			slog.Warn("queue declare failed",
 				"service", serviceName,
@@ -291,7 +312,8 @@ func startRabbitMQConsumer() {
 			continue
 		}
 
-		msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
+		// Manual ack mode (autoAck = false)
+		msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
 		if err != nil {
 			slog.Warn("consume failed",
 				"service", serviceName,
@@ -303,7 +325,7 @@ func startRabbitMQConsumer() {
 			continue
 		}
 
-		slog.Info("rabbitmq consumer started", "service", serviceName)
+		slog.Info("rabbitmq consumer started", "service", serviceName, "queue", queueName, "dlq", dlqName)
 
 		for msg := range msgs {
 			// Extract correlation ID from AMQP headers
@@ -321,11 +343,15 @@ func startRabbitMQConsumer() {
 				Action         string `json:"action"`
 			}
 			if err := json.Unmarshal(msg.Body, &update); err != nil {
-				slog.Warn("invalid message",
+				slog.Warn("message sent to DLQ",
 					"service", serviceName,
+					"msg", "message sent to DLQ",
+					"queue", dlqName,
+					"reason", "JSON parse error: "+err.Error(),
 					"correlation_id", correlationID,
-					"error", err.Error(),
 				)
+				// Nack without requeue - sends to DLQ
+				msg.Nack(false, false)
 				continue
 			}
 
@@ -340,13 +366,20 @@ func startRabbitMQConsumer() {
 
 			result, err := db.Exec(`UPDATE products SET stock = stock + $1, updated_at = NOW() WHERE id = $2`, update.QuantityChange, update.ProductID)
 			if err != nil {
-				slog.Error("stock update failed",
+				slog.Error("message sent to DLQ",
 					"service", serviceName,
+					"msg", "message sent to DLQ",
+					"queue", dlqName,
+					"reason", "DB error: "+err.Error(),
 					"correlation_id", correlationID,
 					"product_id", update.ProductID,
-					"error", err.Error(),
 				)
-			} else if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+				// Nack without requeue - sends to DLQ
+				msg.Nack(false, false)
+				continue
+			}
+
+			if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
 				// Update inventory gauge
 				var newStock int
 				if err := db.QueryRow(`SELECT stock FROM products WHERE id = $1`, update.ProductID).Scan(&newStock); err == nil {
@@ -354,6 +387,9 @@ func startRabbitMQConsumer() {
 				}
 				inventoryUpdatesTotal.WithLabelValues(update.ProductID, update.Action).Inc()
 			}
+
+			// Successfully processed - acknowledge the message
+			msg.Ack(false)
 		}
 
 		slog.Warn("rabbitmq connection lost, reconnecting", "service", serviceName)
