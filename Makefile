@@ -97,6 +97,10 @@ boot-kind:
 	@echo "--- Creating Kind cluster ---"
 	@kind get clusters 2>/dev/null | grep -q freshcart || kind create cluster --name freshcart --config k8s/kind-config.yml
 	@kubectl cluster-info --context kind-freshcart
+	@echo "--- Installing Calico CNI for NetworkPolicy support ---"
+	@kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml 2>/dev/null || true
+	@echo "--- Waiting for Calico to be ready ---"
+	@kubectl wait --for=condition=ready pod -l k8s-app=calico-node -n kube-system --timeout=120s 2>/dev/null || true
 
 # Step 2: Build and load images into Kind
 boot-images:

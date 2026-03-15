@@ -1,22 +1,25 @@
+# =============================================================================
+# FreshCart Network Policies - Defense in Depth
+# =============================================================================
+# Default deny all ingress, then explicitly allow only required paths:
+#   - External → api-gateway (port 8080)
+#   - api-gateway → all backend services
+#   - order-service → product-service (saga inventory calls)
+#   - observability namespace → all services (metrics scraping)
+# =============================================================================
+
+# Default deny all ingress traffic
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: ecommerce-default-deny
+  name: default-deny-ingress
   namespace: ecommerce
 spec:
   podSelector: {}
   policyTypes:
     - Ingress
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              name: ecommerce
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              name: observability
 ---
+# Allow external traffic to api-gateway on port 8080
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -29,6 +32,121 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    - from: []
-      ports:
+    - ports:
         - port: 8080
+---
+# Allow api-gateway to reach user-service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-user
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: user-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8081
+---
+# Allow api-gateway to reach product-service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-product
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: product-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8082
+---
+# Allow api-gateway to reach order-service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-order
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: order-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8083
+---
+# Allow api-gateway to reach notification-service
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-to-notification
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: notification-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8084
+---
+# Allow order-service to reach product-service (saga inventory operations)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-order-to-product
+  namespace: ecommerce
+spec:
+  podSelector:
+    matchLabels:
+      app: product-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: order-service
+      ports:
+        - port: 8082
+---
+# Allow observability namespace to scrape metrics from all services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-observability-scrape
+  namespace: ecommerce
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability

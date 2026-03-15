@@ -377,6 +377,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 }
 
 // migrate creates the orders and order_items tables if they don't exist.
+// Retries up to 30 times with 1 second delay to handle K8s DNS propagation delays.
 func migrate() {
 	schema := `
 	CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -397,10 +398,16 @@ func migrate() {
 		quantity INTEGER NOT NULL,
 		unit_price DECIMAL(10,2) NOT NULL
 	);`
-	if _, err := db.Exec(schema); err != nil {
-		slog.Warn("migration warning", "service", serviceName, "error", err.Error())
+	for i := 0; i < 30; i++ {
+		if _, err := db.Exec(schema); err != nil {
+			slog.Warn("migration attempt failed, retrying", "service", serviceName, "attempt", i+1, "error", err.Error())
+			time.Sleep(time.Second)
+			continue
+		}
+		slog.Info("migration completed", "service", serviceName)
+		return
 	}
-	slog.Info("migration completed", "service", serviceName)
+	slog.Error("migration failed after 30 attempts", "service", serviceName)
 }
 
 // connectRabbitMQ establishes a connection to RabbitMQ with retry logic.
