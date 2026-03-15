@@ -23,6 +23,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -458,7 +460,12 @@ func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 		IdleConnTimeout:       30 * time.Second,
 		MaxIdleConnsPerHost:   10,
 	}
-	proxy.Transport = otelhttp.NewTransport(baseTransport)
+	// Explicitly pass tracer provider and propagator to ensure trace context propagation
+	proxy.Transport = otelhttp.NewTransport(
+		baseTransport,
+		otelhttp.WithTracerProvider(otel.GetTracerProvider()),
+		otelhttp.WithPropagators(otel.GetTextMapPropagator()),
+	)
 
 	// Handle proxy errors (timeouts, connection failures)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -474,7 +481,7 @@ func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 		json.NewEncoder(w).Encode(map[string]string{"error": "upstream service unavailable"})
 	}
 
-	// Modify the Director to forward all headers including Authorization and X-Correlation-ID
+	// Modify the Director to forward all headers including Authorization, X-Correlation-ID, and trace context
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
@@ -482,7 +489,8 @@ func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 		if correlationID := getCorrelationID(req.Context()); correlationID != "" {
 			req.Header.Set("X-Correlation-ID", correlationID)
 		}
-		// Authorization header is already present and will be forwarded automatically
+		// Inject OTel trace context headers (traceparent, tracestate) for distributed tracing
+		otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 	}
 
 	return http.StripPrefix(prefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

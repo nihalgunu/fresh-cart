@@ -365,14 +365,8 @@ check "$([ "$UUID_MATCH" -gt 0 ] && echo true)" "Auto-generated correlation ID i
 echo ""
 echo "--- Rate Limiting ---"
 RATE_LIMITED=false
-# Send 300 requests in parallel batches to exceed 100/s
-for batch in $(seq 1 6); do
-  for i in $(seq 1 50); do
-    curl -s -o /dev/null -w "%{http_code}\n" "$GATEWAY/health" &
-  done | grep -q "429" && RATE_LIMITED=true
-  wait
-  if [ "$RATE_LIMITED" = "true" ]; then break; fi
-done
+# Use xargs for true parallelism — 500 requests, 50 at a time
+seq 1 500 | xargs -P 50 -I {} curl -s -o /dev/null -w "%{http_code}\n" "$GATEWAY/health" 2>/dev/null | grep -q "429" && RATE_LIMITED=true
 check "$([ "$RATE_LIMITED" = "true" ] && echo true)" "Rate limiting triggers 429"
 
 # ---- PROMETHEUS SERVER ----
@@ -506,9 +500,22 @@ done
 TRACE_COUNT=$(curl -s "http://localhost:16686/api/traces?service=api-gateway&limit=5" | jq '.data | length' 2>/dev/null)
 check "$([ "$TRACE_COUNT" -gt 0 ] && echo true)" "Jaeger has api-gateway traces → count: $TRACE_COUNT"
 
-# Check a trace has multiple spans (meaning it crossed services)
-FIRST_TRACE_SPANS=$(curl -s "http://localhost:16686/api/traces?service=api-gateway&limit=1" | jq '.data[0].spans | length' 2>/dev/null)
-check "$([ "$FIRST_TRACE_SPANS" -gt 1 ] && echo true)" "Trace has multiple spans (cross-service) → spans: $FIRST_TRACE_SPANS"
+# Find a trace with multiple spans (the order trace, not a health check)
+MULTI_SPAN_FOUND=false
+ALL_TRACES=$(curl -s "http://localhost:16686/api/traces?service=api-gateway&limit=20" 2>/dev/null)
+TRACE_COUNT_MULTI=$(echo "$ALL_TRACES" | jq '.data | length' 2>/dev/null)
+MAX_SPANS=0
+for i in $(seq 0 $((TRACE_COUNT_MULTI - 1))); do
+  SPAN_COUNT=$(echo "$ALL_TRACES" | jq ".data[$i].spans | length" 2>/dev/null)
+  if [ "$SPAN_COUNT" -gt "$MAX_SPANS" ] 2>/dev/null; then
+    MAX_SPANS=$SPAN_COUNT
+  fi
+  if [ "$SPAN_COUNT" -gt 1 ] 2>/dev/null; then
+    MULTI_SPAN_FOUND=true
+    break
+  fi
+done
+check "$([ "$MULTI_SPAN_FOUND" = "true" ] && echo true)" "Trace has multiple spans (cross-service) → max spans found: $MAX_SPANS"
 
 # Check that order-service traces exist
 ORDER_TRACE_COUNT=$(curl -s "http://localhost:16686/api/traces?service=order-service&limit=5" | jq '.data | length' 2>/dev/null)
