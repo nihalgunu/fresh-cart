@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"api-gateway/internal/tracing"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-jwt/jwt/v5"
@@ -20,6 +22,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const serviceName = "api-gateway"
@@ -63,6 +67,15 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
+
+	// Initialize OpenTelemetry tracer
+	shutdown, err := tracing.InitTracer(serviceName)
+	if err != nil {
+		slog.Error("failed to init tracer", "service", serviceName, "error", err.Error())
+	} else {
+		defer shutdown(context.Background())
+		slog.Info("tracer initialized", "service", serviceName)
+	}
 
 	// Initialize Redis client
 	redisURL := getEnv("REDIS_URL", "redis://localhost:6379")
@@ -124,7 +137,13 @@ func main() {
 
 	port := getEnv("PORT", "8080")
 	slog.Info("api-gateway starting", "service", serviceName, "port", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
+
+	// Wrap handler with OpenTelemetry instrumentation
+	handler := otelhttp.NewHandler(r, "server",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	)
+
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		slog.Error("server failed", "service", serviceName, "error", err.Error())
 		os.Exit(1)
 	}
@@ -385,14 +404,23 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
-		slog.Info("request completed",
+
+		// Extract trace ID from span context
+		logAttrs := []any{
 			"service", serviceName,
 			"correlation_id", getCorrelationID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
-		)
+		}
+
+		spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+		if spanCtx.HasTraceID() {
+			logAttrs = append(logAttrs, "trace_id", spanCtx.TraceID().String())
+		}
+
+		slog.Info("request completed", logAttrs...)
 	})
 }
 
@@ -424,12 +452,13 @@ func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
-	// Set timeout on the transport for resilience
-	proxy.Transport = &http.Transport{
+	// Set timeout on the transport for resilience, wrapped with OpenTelemetry
+	baseTransport := &http.Transport{
 		ResponseHeaderTimeout: 5 * time.Second,
 		IdleConnTimeout:       30 * time.Second,
 		MaxIdleConnsPerHost:   10,
 	}
+	proxy.Transport = otelhttp.NewTransport(baseTransport)
 
 	// Handle proxy errors (timeouts, connection failures)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {

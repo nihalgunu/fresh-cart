@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"time"
 
+	"order-service/internal/resilience"
+	"order-service/internal/tracing"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
@@ -20,8 +23,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
-
-	"order-service/internal/resilience"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const serviceName = "order-service"
@@ -159,6 +164,15 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	// Initialize OpenTelemetry tracer
+	shutdown, err := tracing.InitTracer(serviceName)
+	if err != nil {
+		slog.Error("failed to init tracer", "service", serviceName, "error", err.Error())
+	} else {
+		defer shutdown(context.Background())
+		slog.Info("tracer initialized", "service", serviceName)
+	}
+
 	productServiceURL = getEnv("PRODUCT_SERVICE_URL", "http://localhost:8082")
 
 	// Initialize resilient HTTP client for product service
@@ -169,10 +183,10 @@ func main() {
 		resilience.DefaultRetryConfig(),
 	)
 
-	var err error
-	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_orders?sslmode=disable"))
-	if err != nil {
-		slog.Error("database connection failed", "service", serviceName, "error", err.Error())
+	var dbErr error
+	db, dbErr = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_orders?sslmode=disable"))
+	if dbErr != nil {
+		slog.Error("database connection failed", "service", serviceName, "error", dbErr.Error())
 		os.Exit(1)
 	}
 	defer db.Close()
@@ -207,7 +221,13 @@ func main() {
 
 	port := getEnv("PORT", "8083")
 	slog.Info("order-service starting", "service", serviceName, "port", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
+
+	// Wrap handler with OpenTelemetry instrumentation
+	handler := otelhttp.NewHandler(r, "server",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	)
+
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		slog.Error("server failed", "service", serviceName, "error", err.Error())
 		os.Exit(1)
 	}
@@ -251,14 +271,23 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
-		slog.Info("request completed",
+
+		// Extract trace ID from span context
+		logAttrs := []any{
 			"service", serviceName,
 			"correlation_id", getCorrelationID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
-		)
+		}
+
+		spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+		if spanCtx.HasTraceID() {
+			logAttrs = append(logAttrs, "trace_id", spanCtx.TraceID().String())
+		}
+
+		slog.Info("request completed", logAttrs...)
 	})
 }
 
@@ -644,16 +673,33 @@ func publishOrderConfirmed(ctx context.Context, order Order) {
 		return
 	}
 
+	// Create a span for RabbitMQ publish
+	tracer := otel.Tracer(serviceName)
+	ctx, span := tracer.Start(ctx, "rabbitmq.publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+	)
+	defer span.End()
+
 	body, _ := json.Marshal(order)
-	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+
+	// Build headers with correlation ID and OTel context
+	headers := amqp.Table{
+		"X-Correlation-ID": correlationID,
+	}
+
+	// Inject OTel context into headers
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		headers[k] = v
+	}
 
 	err := rabbitCh.PublishWithContext(pubCtx, "orders", "order.confirmed", false, false, amqp.Publishing{
 		ContentType: "application/json",
 		Body:        body,
-		Headers: amqp.Table{
-			"X-Correlation-ID": correlationID,
-		},
+		Headers:     headers,
 	})
 	if err != nil {
 		slog.Error("event publish failed",
@@ -879,18 +925,35 @@ func publishOrderEvent(ctx context.Context, event OrderStatusEvent) {
 		return
 	}
 
+	// Create a span for RabbitMQ publish
+	tracer := otel.Tracer(serviceName)
+	ctx, span := tracer.Start(ctx, "rabbitmq.publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+	)
+	defer span.End()
+
 	body, _ := json.Marshal(event)
-	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	routingKey := "order." + event.Status
 
+	// Build headers with correlation ID and OTel context
+	headers := amqp.Table{
+		"X-Correlation-ID": correlationID,
+	}
+
+	// Inject OTel context into headers
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		headers[k] = v
+	}
+
 	err := rabbitCh.PublishWithContext(pubCtx, "orders", routingKey, false, false, amqp.Publishing{
 		ContentType: "application/json",
 		Body:        body,
-		Headers: amqp.Table{
-			"X-Correlation-ID": correlationID,
-		},
+		Headers:     headers,
 	})
 	if err != nil {
 		slog.Error("event publish failed",

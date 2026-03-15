@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"product-service/internal/tracing"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
@@ -17,6 +19,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const serviceName = "product-service"
@@ -99,10 +105,19 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	var err error
-	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_products?sslmode=disable"))
+	// Initialize OpenTelemetry tracer
+	shutdown, err := tracing.InitTracer(serviceName)
 	if err != nil {
-		slog.Error("database connection failed", "service", serviceName, "error", err.Error())
+		slog.Error("failed to init tracer", "service", serviceName, "error", err.Error())
+	} else {
+		defer shutdown(context.Background())
+		slog.Info("tracer initialized", "service", serviceName)
+	}
+
+	var dbErr error
+	db, dbErr = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_products?sslmode=disable"))
+	if dbErr != nil {
+		slog.Error("database connection failed", "service", serviceName, "error", dbErr.Error())
 		os.Exit(1)
 	}
 	defer db.Close()
@@ -136,13 +151,20 @@ func main() {
 	r.Get("/ready", readyHandler)
 
 	r.Get("/api/v1/products", listProductsHandler)
+	r.Get("/api/v1/products/search", searchProductsHandler)
 	r.Get("/api/v1/products/{id}", getProductHandler)
 	r.Post("/api/v1/products", createProductHandler)
 	r.Patch("/api/v1/products/{id}/stock", updateStockHandler)
 
 	port := getEnv("PORT", "8082")
 	slog.Info("product-service starting", "service", serviceName, "port", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
+
+	// Wrap handler with OpenTelemetry instrumentation
+	handler := otelhttp.NewHandler(r, "server",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	)
+
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		slog.Error("server failed", "service", serviceName, "error", err.Error())
 		os.Exit(1)
 	}
@@ -204,14 +226,23 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
-		slog.Info("request completed",
+
+		// Extract trace ID from span context
+		logAttrs := []any{
 			"service", serviceName,
 			"correlation_id", getCorrelationID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
-		)
+		}
+
+		spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+		if spanCtx.HasTraceID() {
+			logAttrs = append(logAttrs, "trace_id", spanCtx.TraceID().String())
+		}
+
+		slog.Info("request completed", logAttrs...)
 	})
 }
 
@@ -327,6 +358,8 @@ func startRabbitMQConsumer() {
 
 		slog.Info("rabbitmq consumer started", "service", serviceName, "queue", queueName, "dlq", dlqName)
 
+		tracer := otel.Tracer(serviceName)
+
 		for msg := range msgs {
 			// Extract correlation ID from AMQP headers
 			correlationID := ""
@@ -334,6 +367,27 @@ func startRabbitMQConsumer() {
 				if cid, ok := msg.Headers["X-Correlation-ID"].(string); ok {
 					correlationID = cid
 				}
+			}
+
+			// Extract OTel context from AMQP headers
+			carrier := propagation.MapCarrier{}
+			for k, v := range msg.Headers {
+				if s, ok := v.(string); ok {
+					carrier[k] = s
+				}
+			}
+			ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+			// Create a span for processing this message
+			ctx, span := tracer.Start(ctx, "rabbitmq.consume",
+				trace.WithSpanKind(trace.SpanKindConsumer),
+			)
+
+			// Get trace ID for logging
+			traceID := ""
+			spanCtx := trace.SpanFromContext(ctx).SpanContext()
+			if spanCtx.HasTraceID() {
+				traceID = spanCtx.TraceID().String()
 			}
 
 			var update struct {
@@ -349,7 +403,9 @@ func startRabbitMQConsumer() {
 					"queue", dlqName,
 					"reason", "JSON parse error: "+err.Error(),
 					"correlation_id", correlationID,
+					"trace_id", traceID,
 				)
+				span.End()
 				// Nack without requeue - sends to DLQ
 				msg.Nack(false, false)
 				continue
@@ -358,6 +414,7 @@ func startRabbitMQConsumer() {
 			slog.Info("inventory update received",
 				"service", serviceName,
 				"correlation_id", correlationID,
+				"trace_id", traceID,
 				"product_id", update.ProductID,
 				"action", update.Action,
 				"order_id", update.OrderID,
@@ -372,8 +429,10 @@ func startRabbitMQConsumer() {
 					"queue", dlqName,
 					"reason", "DB error: "+err.Error(),
 					"correlation_id", correlationID,
+					"trace_id", traceID,
 					"product_id", update.ProductID,
 				)
+				span.End()
 				// Nack without requeue - sends to DLQ
 				msg.Nack(false, false)
 				continue
@@ -388,6 +447,7 @@ func startRabbitMQConsumer() {
 				inventoryUpdatesTotal.WithLabelValues(update.ProductID, update.Action).Inc()
 			}
 
+			span.End()
 			// Successfully processed - acknowledge the message
 			msg.Ack(false)
 		}
@@ -427,6 +487,90 @@ func listProductsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		products = append(products, p)
 	}
+
+	json.NewEncoder(w).Encode(products)
+}
+
+func searchProductsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
+	// Parse query parameters
+	q := r.URL.Query().Get("q")
+	category := r.URL.Query().Get("category")
+	minPriceStr := r.URL.Query().Get("min_price")
+	maxPriceStr := r.URL.Query().Get("max_price")
+	inStockStr := r.URL.Query().Get("in_stock")
+
+	// Build dynamic query
+	query := `SELECT id, name, description, price, category, stock, image_url, created_at FROM products WHERE 1=1`
+	args := []interface{}{}
+	argNum := 1
+
+	if q != "" {
+		query += ` AND (name ILIKE '%' || $` + strconv.Itoa(argNum) + ` || '%' OR description ILIKE '%' || $` + strconv.Itoa(argNum) + ` || '%')`
+		args = append(args, q)
+		argNum++
+	}
+
+	if category != "" {
+		query += ` AND category = $` + strconv.Itoa(argNum)
+		args = append(args, category)
+		argNum++
+	}
+
+	if minPriceStr != "" {
+		minPrice, err := strconv.ParseFloat(minPriceStr, 64)
+		if err == nil {
+			query += ` AND price >= $` + strconv.Itoa(argNum)
+			args = append(args, minPrice)
+			argNum++
+		}
+	}
+
+	if maxPriceStr != "" {
+		maxPrice, err := strconv.ParseFloat(maxPriceStr, 64)
+		if err == nil {
+			query += ` AND price <= $` + strconv.Itoa(argNum)
+			args = append(args, maxPrice)
+			argNum++
+		}
+	}
+
+	if inStockStr == "true" {
+		query += ` AND stock > 0`
+	}
+
+	query += ` ORDER BY name`
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		slog.Error("product search failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"error", err.Error(),
+		)
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	products := []Product{}
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category, &p.Stock, &p.ImageURL, &p.CreatedAt); err != nil {
+			continue
+		}
+		products = append(products, p)
+	}
+
+	slog.Info("product search",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"query", q,
+		"category", category,
+		"results", len(products),
+	)
 
 	json.NewEncoder(w).Encode(products)
 }

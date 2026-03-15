@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"notification-service/internal/tracing"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
@@ -19,6 +21,10 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const serviceName = "notification-service"
@@ -105,6 +111,15 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	// Initialize OpenTelemetry tracer
+	shutdown, err := tracing.InitTracer(serviceName)
+	if err != nil {
+		slog.Error("failed to init tracer", "service", serviceName, "error", err.Error())
+	} else {
+		defer shutdown(context.Background())
+		slog.Info("tracer initialized", "service", serviceName)
+	}
+
 	connectMongoDB()
 	go startRabbitMQConsumer()
 
@@ -123,7 +138,13 @@ func main() {
 
 	port := getEnv("PORT", "8084")
 	slog.Info("notification-service starting", "service", serviceName, "port", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
+
+	// Wrap handler with OpenTelemetry instrumentation
+	handler := otelhttp.NewHandler(r, "server",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	)
+
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		slog.Error("server failed", "service", serviceName, "error", err.Error())
 		os.Exit(1)
 	}
@@ -167,14 +188,23 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
-		slog.Info("request completed",
+
+		// Extract trace ID from span context
+		logAttrs := []any{
 			"service", serviceName,
 			"correlation_id", getCorrelationID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
-		)
+		}
+
+		spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+		if spanCtx.HasTraceID() {
+			logAttrs = append(logAttrs, "trace_id", spanCtx.TraceID().String())
+		}
+
+		slog.Info("request completed", logAttrs...)
 	})
 }
 
@@ -328,6 +358,8 @@ func startRabbitMQConsumer() {
 
 		slog.Info("rabbitmq consumer started", "service", serviceName, "queue", queueName, "dlq", dlqName)
 
+		tracer := otel.Tracer(serviceName)
+
 		for msg := range msgs {
 			// Extract correlation ID from AMQP headers
 			correlationID := ""
@@ -335,6 +367,27 @@ func startRabbitMQConsumer() {
 				if cid, ok := msg.Headers["X-Correlation-ID"].(string); ok {
 					correlationID = cid
 				}
+			}
+
+			// Extract OTel context from AMQP headers
+			carrier := propagation.MapCarrier{}
+			for k, v := range msg.Headers {
+				if s, ok := v.(string); ok {
+					carrier[k] = s
+				}
+			}
+			ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+			// Create a span for processing this message
+			ctx, span := tracer.Start(ctx, "rabbitmq.consume",
+				trace.WithSpanKind(trace.SpanKindConsumer),
+			)
+
+			// Get trace ID for logging
+			traceID := ""
+			spanCtx := trace.SpanFromContext(ctx).SpanContext()
+			if spanCtx.HasTraceID() {
+				traceID = spanCtx.TraceID().String()
 			}
 
 			routingKey := msg.RoutingKey
@@ -355,8 +408,10 @@ func startRabbitMQConsumer() {
 						"queue", dlqName,
 						"reason", "JSON parse error: "+err.Error(),
 						"correlation_id", correlationID,
+						"trace_id", traceID,
 						"routing_key", routingKey,
 					)
+					span.End()
 					// Nack without requeue - sends to DLQ
 					msg.Nack(false, false)
 					continue
@@ -368,6 +423,7 @@ func startRabbitMQConsumer() {
 			slog.Info("order event received",
 				"service", serviceName,
 				"correlation_id", correlationID,
+				"trace_id", traceID,
 				"routing_key", routingKey,
 				"order_id", orderID,
 				"user_id", userID,
@@ -382,7 +438,9 @@ func startRabbitMQConsumer() {
 					"queue", dlqName,
 					"reason", "unknown routing key: "+routingKey,
 					"correlation_id", correlationID,
+					"trace_id", traceID,
 				)
+				span.End()
 				// Nack without requeue - sends to DLQ
 				msg.Nack(false, false)
 				continue
@@ -403,8 +461,8 @@ func startRabbitMQConsumer() {
 				CreatedAt: time.Now(),
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, err := notificationsCollection.InsertOne(ctx, notification)
+			dbCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_, err := notificationsCollection.InsertOne(dbCtx, notification)
 			cancel()
 			if err != nil {
 				slog.Error("message sent to DLQ",
@@ -413,8 +471,10 @@ func startRabbitMQConsumer() {
 					"queue", dlqName,
 					"reason", "MongoDB error: "+err.Error(),
 					"correlation_id", correlationID,
+					"trace_id", traceID,
 					"order_id", orderID,
 				)
+				span.End()
 				// Nack without requeue - sends to DLQ
 				msg.Nack(false, false)
 				continue
@@ -426,11 +486,13 @@ func startRabbitMQConsumer() {
 			slog.Info("notification stored",
 				"service", serviceName,
 				"correlation_id", correlationID,
+				"trace_id", traceID,
 				"order_id", orderID,
 				"user_id", userID,
 				"type", notificationType,
 			)
 
+			span.End()
 			// Successfully processed - acknowledge the message
 			msg.Ack(false)
 		}

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-gateway-config
+  namespace: ecommerce
+data:
+  USER_SERVICE_URL: "http://user-service.ecommerce.svc.cluster.local:8081"
+  PRODUCT_SERVICE_URL: "http://product-service.ecommerce.svc.cluster.local:8082"
+  ORDER_SERVICE_URL: "http://order-service.ecommerce.svc.cluster.local:8083"
+  NOTIFICATION_SERVICE_URL: "http://notification-service.ecommerce.svc.cluster.local:8084"
+  REDIS_URL: "redis://redis.ecommerce-data.svc.cluster.local:6379"
+  RATE_LIMIT_RPS: "100"
+  RATE_LIMIT_BURST: "200"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger.observability.svc.cluster.local:4318"
+  OTEL_SERVICE_NAME: "api-gateway"

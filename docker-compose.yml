@@ -13,6 +13,8 @@ services:
       - REDIS_URL=redis://redis:6379
       - RATE_LIMIT_RPS=100
       - RATE_LIMIT_BURST=200
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=api-gateway
     depends_on:
       - user-service
       - product-service
@@ -41,6 +43,8 @@ services:
       - PORT=8081
       - DATABASE_URL=postgres://freshcart:freshcart@user-db:5432/freshcart_users?sslmode=disable
       - JWT_SECRET=freshcart-dev-secret
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=user-service
     depends_on:
       user-db:
         condition: service_healthy
@@ -55,6 +59,8 @@ services:
       - PORT=8082
       - DATABASE_URL=postgres://freshcart:freshcart@product-db:5432/freshcart_products?sslmode=disable
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=product-service
     depends_on:
       product-db:
         condition: service_healthy
@@ -72,6 +78,8 @@ services:
       - DATABASE_URL=postgres://freshcart:freshcart@order-db:5432/freshcart_orders?sslmode=disable
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - PRODUCT_SERVICE_URL=http://product-service:8082
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=order-service
     depends_on:
       order-db:
         condition: service_healthy
@@ -89,6 +97,8 @@ services:
       - MONGODB_URI=mongodb://notification-db:27017
       - MONGODB_DATABASE=freshcart_notifications
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=notification-service
     depends_on:
       notification-db:
         condition: service_started
@@ -146,7 +156,7 @@ services:
       - freshcart
 
   notification-db:
-    image: mongo:7-jammy
+    image: mongo:6-jammy
     volumes:
       - notification-db-data:/data/db
     networks:

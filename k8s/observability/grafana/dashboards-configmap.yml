@@ -1,0 +1,344 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: observability
+data:
+  service-overview.json: |
+    {
+      "uid": "service-overview",
+      "title": "Service Overview",
+      "tags": ["freshcart", "overview"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "service",
+            "type": "query",
+            "datasource": "Prometheus",
+            "query": "label_values(http_requests_total, service)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true,
+            "current": {
+              "selected": true,
+              "text": "All",
+              "value": "$__all"
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Request Rate per Service",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(rate(http_requests_total{service=~\"$service\"}[5m])) by (service)",
+              "legendFormat": "{{ service }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              }
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Error Rate per Service",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(rate(http_requests_total{service=~\"$service\", status=~\"5..\"}[5m])) by (service) / sum(rate(http_requests_total{service=~\"$service\"}[5m])) by (service) * 100",
+              "legendFormat": "{{ service }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              }
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "Latency (p50/p95/p99) per Service",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le, service))",
+              "legendFormat": "{{ service }} p50",
+              "refId": "A"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le, service))",
+              "legendFormat": "{{ service }} p95",
+              "refId": "B"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service=~\"$service\"}[5m])) by (le, service))",
+              "legendFormat": "{{ service }} p99",
+              "refId": "C"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              }
+            }
+          }
+        }
+      ]
+    }
+  business-metrics.json: |
+    {
+      "uid": "business-metrics",
+      "title": "Business Metrics",
+      "tags": ["freshcart", "business"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Orders Created Total",
+          "type": "stat",
+          "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(orders_created_total) or vector(0)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "blue", "value": null }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Orders Created Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 6, "w": 18, "x": 6, "y": 0 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(rate(orders_created_total[5m]))",
+              "legendFormat": "Orders/sec",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 20
+              }
+            }
+          }
+        },
+        {
+          "id": 3,
+          "title": "Inventory Levels by Product",
+          "type": "gauge",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "inventory_level",
+              "legendFormat": "{{ product_id }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "max": 100,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 5 },
+                  { "color": "green", "value": 20 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 5,
+          "title": "Users Registered Total",
+          "type": "stat",
+          "gridPos": { "h": 6, "w": 6, "x": 0, "y": 14 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(users_registered_total) or vector(0)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 6,
+          "title": "Notifications Sent Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 6, "w": 18, "x": 6, "y": 14 },
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(rate(notifications_sent_total[5m])) by (type)",
+              "legendFormat": "{{ type }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 20
+              }
+            }
+          }
+        }
+      ]
+    }
+  logs-explorer.json: |
+    {
+      "uid": "logs-explorer",
+      "title": "Logs Explorer",
+      "tags": ["freshcart", "logs"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "service",
+            "type": "query",
+            "datasource": "Loki",
+            "query": "label_values(service)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true,
+            "current": {
+              "selected": true,
+              "text": "All",
+              "value": "$__all"
+            }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Log Volume by Level",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+          "datasource": "Loki",
+          "targets": [
+            {
+              "expr": "sum(count_over_time({service=~\"$service\"} | json | level != \"\" [1m])) by (level)",
+              "legendFormat": "{{ level }}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "bars",
+                "lineWidth": 1,
+                "fillOpacity": 70
+              }
+            }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Logs",
+          "type": "logs",
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 8 },
+          "datasource": "Loki",
+          "targets": [
+            {
+              "expr": "{service=~\"$service\"}",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": true,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none"
+          }
+        }
+      ]
+    }

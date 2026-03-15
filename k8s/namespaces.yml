@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecommerce
+  labels:
+    name: ecommerce
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecommerce-data
+  labels:
+    name: ecommerce-data
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability

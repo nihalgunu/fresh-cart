@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"user-service/internal/tracing"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/golang-jwt/jwt/v5"
@@ -17,6 +19,8 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -94,12 +98,21 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	// Initialize OpenTelemetry tracer
+	shutdown, err := tracing.InitTracer(serviceName)
+	if err != nil {
+		slog.Error("failed to init tracer", "service", serviceName, "error", err.Error())
+	} else {
+		defer shutdown(context.Background())
+		slog.Info("tracer initialized", "service", serviceName)
+	}
+
 	jwtSecret = []byte(getEnv("JWT_SECRET", "freshcart-dev-secret"))
 
-	var err error
-	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_users?sslmode=disable"))
-	if err != nil {
-		slog.Error("database connection failed", "service", serviceName, "error", err.Error())
+	var dbErr error
+	db, dbErr = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_users?sslmode=disable"))
+	if dbErr != nil {
+		slog.Error("database connection failed", "service", serviceName, "error", dbErr.Error())
 		os.Exit(1)
 	}
 	defer db.Close()
@@ -132,7 +145,13 @@ func main() {
 
 	port := getEnv("PORT", "8081")
 	slog.Info("user-service starting", "service", serviceName, "port", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
+
+	// Wrap handler with OpenTelemetry instrumentation
+	handler := otelhttp.NewHandler(r, "server",
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	)
+
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		slog.Error("server failed", "service", serviceName, "error", err.Error())
 		os.Exit(1)
 	}
@@ -176,14 +195,23 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
-		slog.Info("request completed",
+
+		// Extract trace ID from span context
+		logAttrs := []any{
 			"service", serviceName,
 			"correlation_id", getCorrelationID(r.Context()),
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
-		)
+		}
+
+		spanCtx := trace.SpanFromContext(r.Context()).SpanContext()
+		if spanCtx.HasTraceID() {
+			logAttrs = append(logAttrs, "trace_id", spanCtx.TraceID().String())
+		}
+
+		slog.Info("request completed", logAttrs...)
 	})
 }
 

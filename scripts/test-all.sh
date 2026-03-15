@@ -465,6 +465,59 @@ check "$([ "$JAEGER_CODE" = "200" ] && echo true)" "Jaeger UI is running → $JA
 JAEGER_API=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:16686/api/services")
 check "$([ "$JAEGER_API" = "200" ] && echo true)" "Jaeger API responds → $JAEGER_API"
 
+# ---- OPENTELEMETRY TRACING ----
+echo ""
+echo "--- OpenTelemetry Tracing ---"
+
+# Generate a traced request
+TRACE_CID="trace-test-$(date +%s)"
+TRACE_REG=$(curl -s -X POST "$GATEWAY/api/v1/auth/register" \
+  -H "Content-Type: application/json" \
+  -H "X-Correlation-ID: $TRACE_CID" \
+  -d "{\"email\":\"traceuser-$TRACE_CID@test.com\",\"password\":\"pass123\",\"name\":\"Trace User\",\"delivery_address\":\"123 Trace St\"}")
+TRACE_TOKEN=$(echo "$TRACE_REG" | jq -r '.token // empty' 2>/dev/null)
+TRACE_USER_ID=$(echo "$TRACE_REG" | jq -r '.id // empty' 2>/dev/null)
+
+# Create a product for trace test
+TRACE_PRODUCT=$(curl -s -X POST "$PRODUCT_SVC/api/v1/products" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Trace Avocado","description":"For tracing","price":3.99,"category":"produce","stock":20}')
+TRACE_PRODUCT_ID=$(echo "$TRACE_PRODUCT" | jq -r '.id // empty' 2>/dev/null)
+
+# Place an order to generate a multi-service trace
+curl -s -X POST "$GATEWAY/api/v1/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TRACE_TOKEN" \
+  -H "X-Correlation-ID: $TRACE_CID" \
+  -d "{\"user_id\":\"$TRACE_USER_ID\",\"delivery_address\":\"123 Trace St\",\"items\":[{\"product_id\":\"$TRACE_PRODUCT_ID\",\"quantity\":1}]}" > /dev/null 2>&1
+
+# Wait for traces to be exported to Jaeger
+sleep 10
+
+# Jaeger should now have services registered
+JAEGER_SERVICES=$(curl -s "http://localhost:16686/api/services" | jq -r '.data[]' 2>/dev/null)
+
+for svc in "api-gateway" "order-service" "product-service"; do
+  SVC_FOUND=$(echo "$JAEGER_SERVICES" | grep -c "$svc" 2>/dev/null)
+  check "$([ "$SVC_FOUND" -gt 0 ] && echo true)" "Jaeger has traces for: $svc"
+done
+
+# Check that traces actually exist for api-gateway
+TRACE_COUNT=$(curl -s "http://localhost:16686/api/traces?service=api-gateway&limit=5" | jq '.data | length' 2>/dev/null)
+check "$([ "$TRACE_COUNT" -gt 0 ] && echo true)" "Jaeger has api-gateway traces → count: $TRACE_COUNT"
+
+# Check a trace has multiple spans (meaning it crossed services)
+FIRST_TRACE_SPANS=$(curl -s "http://localhost:16686/api/traces?service=api-gateway&limit=1" | jq '.data[0].spans | length' 2>/dev/null)
+check "$([ "$FIRST_TRACE_SPANS" -gt 1 ] && echo true)" "Trace has multiple spans (cross-service) → spans: $FIRST_TRACE_SPANS"
+
+# Check that order-service traces exist
+ORDER_TRACE_COUNT=$(curl -s "http://localhost:16686/api/traces?service=order-service&limit=5" | jq '.data | length' 2>/dev/null)
+check "$([ "$ORDER_TRACE_COUNT" -gt 0 ] && echo true)" "Jaeger has order-service traces → count: $ORDER_TRACE_COUNT"
+
+# Verify trace_id appears in structured logs
+TRACE_ID_IN_LOGS=$(docker compose logs 2>&1 | grep -c "trace_id" 2>/dev/null)
+check "$([ "$TRACE_ID_IN_LOGS" -gt 0 ] && echo true)" "Logs contain trace_id field → occurrences: $TRACE_ID_IN_LOGS"
+
 # ---- CIRCUIT BREAKER ----
 echo ""
 echo "--- Circuit Breaker ---"
