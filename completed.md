@@ -223,3 +223,147 @@ Comprehensive integration test with 61 test cases covering:
 ```bash
 make test-all
 ```
+
+---
+
+## Phase 4: Observability Stack
+
+### Prometheus Server (port 9090)
+- Centralized metrics aggregation
+- Scrapes all 5 microservices at `/metrics` endpoints
+- 7-day data retention
+- Alert rules for production monitoring:
+  - `HighErrorRate` - Error rate > 5% over 5 minutes
+  - `ServiceDown` - Service unreachable for 1 minute
+  - `HighLatency` - P95 latency > 500ms
+  - `LowInventory` - Product stock below threshold
+
+### Loki Log Aggregation (port 3100)
+- Centralized log storage and querying
+- Labels for filtering: `service`, `container`, etc.
+- Query by correlation ID across all services
+- LogQL query language support
+
+### Promtail
+- Ships container logs to Loki
+- Extracts labels from Docker container metadata
+- Parses JSON log lines for structured fields
+
+### Grafana Dashboards (port 3000)
+- **Service Overview** - Health, request rates, error rates, latencies
+- **Business Metrics** - Orders, registrations, inventory levels
+- **Logs Explorer** - Search and filter logs across services
+- Pre-provisioned datasources: Prometheus, Loki, Jaeger
+- Default credentials: admin/admin
+
+### Jaeger Tracing (port 16686)
+- Distributed tracing UI
+- OTLP collector enabled (port 4318)
+- Ready for OpenTelemetry instrumentation
+
+---
+
+## Phase 5: Resilience Patterns
+
+### Circuit Breaker (Order Service → Product Service)
+- States: Closed (0), Half-Open (1), Open (2)
+- Failure threshold: 5 consecutive failures to open
+- Success threshold: 3 consecutive successes to close
+- Open timeout: 10 seconds before testing recovery
+- Prometheus metric: `circuit_breaker_state{target="product-service"}`
+
+### Retry with Exponential Backoff
+- Max retries: 3
+- Initial delay: 100ms
+- Max delay: 2 seconds
+- Backoff multiplier: 2x
+- Retries on: connection errors, timeouts, 5xx responses
+
+### Timeouts
+- HTTP client timeout: 5 seconds per request
+- Context-based cancellation propagation
+
+### Bulkhead Pattern
+- Saga execution limited to 10 concurrent operations
+- Returns 503 Service Unavailable when bulkhead full
+
+### Dead Letter Queues (RabbitMQ)
+- `inventory.update.dlq` - Failed inventory update messages
+- `notifications.order.dlq` - Failed notification messages
+- Main queues configured with:
+  - `x-dead-letter-exchange: ""`
+  - `x-dead-letter-routing-key: <queue>.dlq`
+- Manual acknowledgment with Nack on failure
+
+---
+
+## Updated Integration Test Suite
+
+### Test Script (`scripts/test-all.sh`)
+Comprehensive integration test with **103 test cases** covering:
+
+### Core Services (61 tests)
+- Health & Readiness (10 tests)
+- Prometheus Metrics - HTTP (5 tests)
+- Authentication (9 tests)
+- User Profile (3 tests)
+- Product CRUD (3 tests)
+- Order Saga (3 tests)
+- Order Retrieval (4 tests)
+- Order State Machine (4 tests)
+- Cancellation & Stock Release (2 tests)
+- Saga Compensation (2 tests)
+- Notifications (6 tests)
+- Prometheus Metrics - Business (4 tests)
+- Structured Logging (1 test)
+- Correlation ID (4 tests)
+- Rate Limiting (1 test)
+
+### Observability Infrastructure (26 tests)
+- **Prometheus Server** (10 tests)
+  - Prometheus health check
+  - Scraping all 5 services (up status)
+  - Alert rules count ≥ 4
+  - Specific alerts exist: HighErrorRate, ServiceDown, HighLatency, LowInventory
+- **Loki Log Aggregation** (5 tests)
+  - Loki health/ready check
+  - Labels exist (Promtail shipping logs)
+  - Service label present
+  - Log query returns results
+  - Correlation ID filtering works
+- **Grafana** (7 tests)
+  - Grafana health check
+  - Datasources: Prometheus, Loki, Jaeger
+  - Dashboards: Service Overview, Business Metrics, Logs Explorer
+- **Jaeger** (2 tests)
+  - Jaeger UI health
+  - Jaeger API responds
+
+### Resilience Tests (16 tests)
+- **Circuit Breaker** (2 tests)
+  - Metric `circuit_breaker_state` exists
+  - Circuit breaker starts in closed state (0)
+- **Dead Letter Queues** (4 tests)
+  - DLQ exists: inventory.update.dlq
+  - DLQ exists: notifications.order.dlq
+  - Main queues have DLQ routing configured
+- **Happy Path Through Resilience Stack** (3 tests)
+  - Order succeeds through circuit breaker + retry + timeout
+  - Order status confirmed
+  - Circuit breaker log references present
+- **Service Stability** (2 tests)
+  - Order service has no panics/fatals
+  - Gateway has no panics/fatals
+- **RabbitMQ Queue Health** (6 tests)
+  - All queues exist: inventory.update, notifications.order, and their DLQs
+  - Main queues have active consumers
+
+### Running Tests
+```bash
+make clean   # Clear volumes (required after code changes to DLQ config)
+make build
+make up
+sleep 30     # Wait for services to initialize
+make test-all
+# Target: 103/103 passed
+```
