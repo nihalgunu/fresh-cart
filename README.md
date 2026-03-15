@@ -25,10 +25,12 @@ make trivy       # Security scanning
 ```
 
 ## Services
-| Service | Port | Database |
-|---------|------|----------|
-| API Gateway | 8080 | Redis |
+| Service | Port (Docker Compose) | Database |
+|---------|------------------------|----------|
+| API Gateway | 8000 | Redis |
 | User Service | 8081 | PostgreSQL |
 | Product Service | 8082 | PostgreSQL |
 | Order Service | 8083 | PostgreSQL |
 | Notification Service | 8084 | MongoDB |
+
+On Kubernetes (Kind), the gateway is exposed at NodePort **30080** (e.g. http://localhost:30080).
