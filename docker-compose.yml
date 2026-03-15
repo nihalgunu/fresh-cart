@@ -1,0 +1,161 @@
+services:
+  api-gateway:
+    build: ./services/api-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - USER_SERVICE_URL=http://user-service:8081
+      - PRODUCT_SERVICE_URL=http://product-service:8082
+      - ORDER_SERVICE_URL=http://order-service:8083
+    depends_on:
+      - user-service
+      - product-service
+      - order-service
+    networks:
+      - freshcart
+
+  user-service:
+    build: ./services/user-service
+    ports:
+      - "8081:8081"
+    environment:
+      - PORT=8081
+      - DATABASE_URL=postgres://freshcart:freshcart@user-db:5432/freshcart_users?sslmode=disable
+      - JWT_SECRET=freshcart-dev-secret
+    depends_on:
+      user-db:
+        condition: service_healthy
+    networks:
+      - freshcart
+
+  product-service:
+    build: ./services/product-service
+    ports:
+      - "8082:8082"
+    environment:
+      - PORT=8082
+      - DATABASE_URL=postgres://freshcart:freshcart@product-db:5432/freshcart_products?sslmode=disable
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      product-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - freshcart
+
+  order-service:
+    build: ./services/order-service
+    ports:
+      - "8083:8083"
+    environment:
+      - PORT=8083
+      - DATABASE_URL=postgres://freshcart:freshcart@order-db:5432/freshcart_orders?sslmode=disable
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - PRODUCT_SERVICE_URL=http://product-service:8082
+    depends_on:
+      order-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - freshcart
+
+  notification-service:
+    build: ./services/notification-service
+    ports:
+      - "8084:8084"
+    environment:
+      - PORT=8084
+      - MONGODB_URI=mongodb://notification-db:27017
+      - MONGODB_DATABASE=freshcart_notifications
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      notification-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - freshcart
+
+  user-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: freshcart
+      POSTGRES_PASSWORD: freshcart
+      POSTGRES_DB: freshcart_users
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freshcart -d freshcart_users"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+    networks:
+      - freshcart
+
+  product-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: freshcart
+      POSTGRES_PASSWORD: freshcart
+      POSTGRES_DB: freshcart_products
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freshcart -d freshcart_products"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - product-db-data:/var/lib/postgresql/data
+    networks:
+      - freshcart
+
+  order-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: freshcart
+      POSTGRES_PASSWORD: freshcart
+      POSTGRES_DB: freshcart_orders
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freshcart -d freshcart_orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - order-db-data:/var/lib/postgresql/data
+    networks:
+      - freshcart
+
+  notification-db:
+    image: mongo:7-jammy
+    volumes:
+      - notification-db-data:/data/db
+    networks:
+      - freshcart
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - freshcart
+
+volumes:
+  user-db-data:
+  product-db-data:
+  order-db-data:
+  notification-db-data:
+  rabbitmq-data:
+
+networks:
+  freshcart:
+    driver: bridge
