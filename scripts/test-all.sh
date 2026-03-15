@@ -594,6 +594,103 @@ for queue in "inventory.update" "notifications.order"; do
   check "$([ "$Q_CONSUMERS" -gt 0 ] && echo true)" "Queue $queue has consumers → $Q_CONSUMERS"
 done
 
+# ---- PRODUCT SEARCH ----
+echo ""
+echo "--- Product Search ---"
+
+curl -s -X POST "$PRODUCT_SVC/api/v1/products" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Search Test Mango","description":"Tropical fruit","price":3.99,"category":"produce","stock":25}' > /dev/null
+
+curl -s -X POST "$PRODUCT_SVC/api/v1/products" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Search Test Yogurt","description":"Greek style","price":5.49,"category":"dairy","stock":40}' > /dev/null
+
+SEARCH_NAME=$(curl -s "$PRODUCT_SVC/api/v1/products/search?q=Mango" | jq 'length' 2>/dev/null)
+check "$([ "$SEARCH_NAME" -gt 0 ] && echo true)" "Search by name finds results → $SEARCH_NAME"
+
+SEARCH_CAT=$(curl -s "$PRODUCT_SVC/api/v1/products/search?category=dairy" | jq 'length' 2>/dev/null)
+check "$([ "$SEARCH_CAT" -gt 0 ] && echo true)" "Search by category finds results → $SEARCH_CAT"
+
+SEARCH_PRICE=$(curl -s "$PRODUCT_SVC/api/v1/products/search?min_price=3&max_price=4" | jq 'length' 2>/dev/null)
+check "$([ "$SEARCH_PRICE" -gt 0 ] && echo true)" "Search by price range finds results → $SEARCH_PRICE"
+
+SEARCH_STOCK=$(curl -s "$PRODUCT_SVC/api/v1/products/search?in_stock=true" | jq 'length' 2>/dev/null)
+check "$([ "$SEARCH_STOCK" -gt 0 ] && echo true)" "Search in-stock products → $SEARCH_STOCK"
+
+SEARCH_EMPTY=$(curl -s "$PRODUCT_SVC/api/v1/products/search?q=xyznonexistent" | jq 'length' 2>/dev/null)
+check "$([ "$SEARCH_EMPTY" = "0" ] && echo true)" "Search with no match returns empty → $SEARCH_EMPTY"
+
+SEARCH_GW_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/products/search?q=Mango")
+check "$([ "$SEARCH_GW_CODE" = "200" ] && echo true)" "Search via gateway with auth → $SEARCH_GW_CODE"
+
+SEARCH_NO_AUTH=$(curl -s -o /dev/null -w "%{http_code}" "$GATEWAY/api/v1/products/search?q=Mango")
+check "$([ "$SEARCH_NO_AUTH" = "401" ] && echo true)" "Search via gateway without auth → $SEARCH_NO_AUTH (expect 401)"
+
+# ---- SCRIPTS & DOCUMENTATION ----
+echo ""
+echo "--- Scripts & Documentation ---"
+
+check "$([ -x scripts/chaos.sh ] && echo true)" "scripts/chaos.sh exists and is executable"
+check "$([ -x scripts/loadtest.sh ] && echo true)" "scripts/loadtest.sh exists and is executable"
+check "$([ -x scripts/trivy-scan.sh ] && echo true)" "scripts/trivy-scan.sh exists and is executable"
+check "$([ -x scripts/seed.sh ] && echo true)" "scripts/seed.sh exists and is executable"
+
+check "$([ -f docs/ARCHITECTURE.md ] && echo true)" "docs/ARCHITECTURE.md exists"
+check "$([ -f docs/SETUP.md ] && echo true)" "docs/SETUP.md exists"
+check "$([ -f README.md ] && echo true)" "README.md exists"
+
+ARCH_SAGA=$(grep -ci "saga" docs/ARCHITECTURE.md 2>/dev/null)
+check "$([ "$ARCH_SAGA" -gt 0 ] && echo true)" "Architecture doc covers saga pattern"
+
+ARCH_RESILIENCE=$(grep -ci "circuit.breaker\|resilience\|retry" docs/ARCHITECTURE.md 2>/dev/null)
+check "$([ "$ARCH_RESILIENCE" -gt 0 ] && echo true)" "Architecture doc covers resilience patterns"
+
+ARCH_OBSERVABILITY=$(grep -ci "observability\|prometheus\|grafana\|jaeger\|loki" docs/ARCHITECTURE.md 2>/dev/null)
+check "$([ "$ARCH_OBSERVABILITY" -gt 0 ] && echo true)" "Architecture doc covers observability stack"
+
+for target in "build" "up" "down" "clean" "logs" "seed" "test-all" "test-k8s" "chaos" "loadtest" "trivy" "boot" "boot-down"; do
+  TARGET_EXISTS=$(grep -c "^${target}:" Makefile 2>/dev/null || grep -c "^${target} " Makefile 2>/dev/null)
+  check "$([ "$TARGET_EXISTS" -gt 0 ] && echo true)" "Makefile has target: $target"
+done
+
+echo ""
+echo "--- Kubernetes Manifests Existence ---"
+
+check "$([ -f k8s/namespaces.yml ] && echo true)" "k8s/namespaces.yml exists"
+
+for svc in "api-gateway" "user-service" "product-service" "order-service" "notification-service"; do
+  check "$([ -f k8s/ecommerce/$svc/deployment.yml ] && echo true)" "K8s deployment: $svc"
+  check "$([ -f k8s/ecommerce/$svc/service.yml ] && echo true)" "K8s service: $svc"
+  check "$([ -f k8s/ecommerce/$svc/pdb.yml ] && echo true)" "K8s PDB: $svc"
+  check "$([ -f k8s/ecommerce/$svc/configmap.yml ] && echo true)" "K8s configmap: $svc"
+done
+
+check "$([ -f k8s/ecommerce/api-gateway/hpa.yml ] && echo true)" "K8s HPA: api-gateway"
+check "$([ -f k8s/ecommerce/order-service/hpa.yml ] && echo true)" "K8s HPA: order-service"
+check "$([ -f k8s/ecommerce/secrets.yml ] && echo true)" "K8s secrets manifest"
+check "$([ -f k8s/ecommerce/network-policy.yml ] && echo true)" "K8s network policy: ecommerce"
+
+for db in "user-db" "product-db" "order-db" "notification-db"; do
+  check "$([ -f k8s/ecommerce-data/$db/statefulset.yml ] || [ -f k8s/ecommerce-data/$db/deployment.yml ] && echo true)" "K8s data: $db"
+  check "$([ -f k8s/ecommerce-data/$db/service.yml ] && echo true)" "K8s service: $db"
+done
+
+check "$([ -f k8s/ecommerce-data/redis/deployment.yml ] && echo true)" "K8s data: redis"
+check "$([ -f k8s/ecommerce-data/rabbitmq/statefulset.yml ] || [ -f k8s/ecommerce-data/rabbitmq/deployment.yml ] && echo true)" "K8s data: rabbitmq"
+check "$([ -f k8s/ecommerce-data/network-policy.yml ] && echo true)" "K8s network policy: ecommerce-data"
+
+for obs in "prometheus" "loki" "grafana" "jaeger"; do
+  OBS_EXISTS=$(ls k8s/observability/$obs/*.yml 2>/dev/null | wc -l)
+  check "$([ "$OBS_EXISTS" -gt 0 ] && echo true)" "K8s observability: $obs"
+done
+
+check "$([ -f k8s/observability/promtail/daemonset.yml ] && echo true)" "K8s promtail daemonset"
+check "$([ -f k8s/kind-config.yml ] && echo true)" "Kind cluster config exists"
+
+OTEL_IN_CONFIGMAPS=$(grep -rl "OTEL_EXPORTER" k8s/ecommerce/ 2>/dev/null | wc -l)
+check "$([ "$OTEL_IN_CONFIGMAPS" -ge 5 ] && echo true)" "OTEL env vars in K8s configmaps → $OTEL_IN_CONFIGMAPS files"
+
 # ---- SUMMARY ----
 echo ""
 echo "============================================"

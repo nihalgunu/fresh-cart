@@ -241,6 +241,61 @@ rm -f "$RESPONSE_FILE"
 
 echo ""
 
+# ============================================
+# SCENARIO 6: Network partition — isolate order-service from product-service
+# ============================================
+echo ""
+echo "--- Scenario 6: Network Partition (order ↔ product) ---"
+
+# Get container IDs
+ORDER_CONTAINER=$(docker compose ps -q order-service)
+PRODUCT_CONTAINER=$(docker compose ps -q product-service)
+
+if [ -n "$ORDER_CONTAINER" ] && [ -n "$PRODUCT_CONTAINER" ]; then
+  # Disconnect product-service from the network
+  NETWORK_NAME=$(docker network ls --filter name=freshcart -q | head -1)
+  NETWORK_FULL=$(docker network ls --filter name=freshcart --format '{{.Name}}' | head -1)
+
+  docker network disconnect "$NETWORK_FULL" "$PRODUCT_CONTAINER" 2>/dev/null
+  sleep 2
+
+  # Orders should fail gracefully (product-service unreachable)
+  PARTITION_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$GATEWAY/api/v1/orders" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"user_id\":\"$USER_ID\",\"delivery_address\":\"123 Test St\",\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":1}]}" \
+    --max-time 10)
+  check "$([ "$PARTITION_CODE" != "000" ] && echo true)" "Order fails gracefully during network partition → $PARTITION_CODE"
+
+  # Gateway and other services should still be healthy
+  GW_PARTITION=$(curl -s -o /dev/null -w "%{http_code}" "$GATEWAY/health")
+  check "$([ "$GW_PARTITION" = "200" ] && echo true)" "Gateway healthy during partition → $GW_PARTITION"
+
+  USER_PARTITION=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8081/health")
+  check "$([ "$USER_PARTITION" = "200" ] && echo true)" "User service healthy during partition → $USER_PARTITION"
+
+  # Reconnect product-service
+  docker network connect "$NETWORK_FULL" "$PRODUCT_CONTAINER" 2>/dev/null
+  echo "  Reconnected product-service to network"
+  sleep 5
+
+  # Verify recovery — product-service should be healthy again
+  wait_for_health "http://localhost:8082"
+  PRODUCT_RECOVERED=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8082/health")
+  check "$([ "$PRODUCT_RECOVERED" = "200" ] && echo true)" "Product service recovered after reconnect → $PRODUCT_RECOVERED"
+
+  # Orders should work again
+  RECONNECT_ORDER=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$GATEWAY/api/v1/orders" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"user_id\":\"$USER_ID\",\"delivery_address\":\"123 Test St\",\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":1}]}")
+  check "$([ "$RECONNECT_ORDER" = "200" ] || [ "$RECONNECT_ORDER" = "201" ] && echo true)" "Orders work after reconnect → $RECONNECT_ORDER"
+else
+  red "Could not find order-service or product-service containers"
+fi
+
+echo ""
+
 # ============================================================================
 # FINAL VERIFICATION
 # ============================================================================

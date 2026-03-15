@@ -6,6 +6,11 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /api-gateway .
 
+# Security scan stage
+FROM aquasec/trivy:latest AS scanner
+COPY --from=builder /api-gateway /api-gateway
+RUN trivy rootfs --no-progress --severity HIGH,CRITICAL --exit-code 0 /
+
 FROM alpine:3.19
 RUN addgroup -g 1000 appgroup && adduser -u 1000 -G appgroup -D appuser
 WORKDIR /app
