@@ -1,9 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -15,6 +16,12 @@ import (
 	_ "github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
+
+const serviceName = "user-service"
+
+type contextKey string
+
+const correlationIDKey contextKey = "correlation_id"
 
 var db *sql.DB
 var jwtSecret []byte
@@ -47,12 +54,18 @@ type AuthResponse struct {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	jwtSecret = []byte(getEnv("JWT_SECRET", "freshcart-dev-secret"))
 
 	var err error
 	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_users?sslmode=disable"))
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("database connection failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -60,14 +73,15 @@ func main() {
 		if err := db.Ping(); err == nil {
 			break
 		}
-		log.Printf("Waiting for database... (%d/30)", i+1)
+		slog.Info("waiting for database", "service", serviceName, "attempt", i+1, "max_attempts", 30)
 		time.Sleep(time.Second)
 	}
 
 	migrate()
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	r.Use(correlationIDMiddleware)
+	r.Use(requestLoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", healthHandler)
@@ -78,8 +92,60 @@ func main() {
 	r.Get("/api/v1/users/{id}", getUserHandler)
 
 	port := getEnv("PORT", "8081")
-	log.Printf("User service starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+	slog.Info("user-service starting", "service", serviceName, "port", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		slog.Error("server failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
+	}
+}
+
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationID := r.Header.Get("X-Correlation-ID")
+		if correlationID == "" {
+			correlationID = uuid.New().String()
+		}
+
+		ctx := context.WithValue(r.Context(), correlationIDKey, correlationID)
+		w.Header().Set("X-Correlation-ID", correlationID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func getCorrelationID(ctx context.Context) string {
+	if id, ok := ctx.Value(correlationIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+		slog.Info("request completed",
+			"service", serviceName,
+			"correlation_id", getCorrelationID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.statusCode,
+			"duration_ms", duration.Milliseconds(),
+		)
+	})
 }
 
 func migrate() {
@@ -95,13 +161,13 @@ func migrate() {
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 	);`
 	if _, err := db.Exec(schema); err != nil {
-		log.Printf("Migration warning: %v", err)
+		slog.Warn("migration warning", "service", serviceName, "error", err.Error())
 	}
-	log.Println("Database migrated")
+	slog.Info("migration completed", "service", serviceName)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "user-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
@@ -110,10 +176,13 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": "user-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -132,18 +201,33 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		req.Email, string(hash), req.Name, req.DeliveryAddress,
 	).Scan(&id)
 	if err != nil {
-		log.Printf("Register error: %v", err)
+		slog.Warn("registration failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"email", req.Email,
+			"reason", "email already exists",
+		)
 		http.Error(w, `{"error":"email already exists"}`, http.StatusConflict)
 		return
 	}
 
 	token := generateToken(id, req.Email)
 
+	slog.Info("user registered",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"user_id", id,
+		"email", req.Email,
+	)
+
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(AuthResponse{ID: id, Email: req.Email, Name: req.Name, Token: token})
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
 	var req LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -153,16 +237,36 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var id, name, passwordHash string
 	err := db.QueryRow(`SELECT id, name, password_hash FROM users WHERE email = $1`, req.Email).Scan(&id, &name, &passwordHash)
 	if err != nil {
+		slog.Warn("login failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"email", req.Email,
+			"reason", "user not found",
+		)
 		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
+		slog.Warn("login failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"email", req.Email,
+			"reason", "invalid credentials",
+		)
 		http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 		return
 	}
 
 	token := generateToken(id, req.Email)
+
+	slog.Info("user logged in",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"user_id", id,
+		"email", req.Email,
+	)
+
 	json.NewEncoder(w).Encode(AuthResponse{ID: id, Email: req.Email, Name: name, Token: token})
 }
 

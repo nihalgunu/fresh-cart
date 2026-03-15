@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -17,6 +17,12 @@ import (
 	_ "github.com/lib/pq"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+const serviceName = "order-service"
+
+type contextKey string
+
+const correlationIDKey contextKey = "correlation_id"
 
 var db *sql.DB
 var rabbitConn *amqp.Connection
@@ -60,12 +66,18 @@ type Product struct {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	productServiceURL = getEnv("PRODUCT_SERVICE_URL", "http://localhost:8082")
 
 	var err error
 	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_orders?sslmode=disable"))
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("database connection failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -73,7 +85,7 @@ func main() {
 		if err := db.Ping(); err == nil {
 			break
 		}
-		log.Printf("Waiting for database... (%d/30)", i+1)
+		slog.Info("waiting for database", "service", serviceName, "attempt", i+1, "max_attempts", 30)
 		time.Sleep(time.Second)
 	}
 
@@ -81,7 +93,8 @@ func main() {
 	connectRabbitMQ()
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	r.Use(correlationIDMiddleware)
+	r.Use(requestLoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", healthHandler)
@@ -92,8 +105,60 @@ func main() {
 	r.Get("/api/v1/orders/user/{user_id}", listUserOrdersHandler)
 
 	port := getEnv("PORT", "8083")
-	log.Printf("Order service starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+	slog.Info("order-service starting", "service", serviceName, "port", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		slog.Error("server failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
+	}
+}
+
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationID := r.Header.Get("X-Correlation-ID")
+		if correlationID == "" {
+			correlationID = uuid.New().String()
+		}
+
+		ctx := context.WithValue(r.Context(), correlationIDKey, correlationID)
+		w.Header().Set("X-Correlation-ID", correlationID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func getCorrelationID(ctx context.Context) string {
+	if id, ok := ctx.Value(correlationIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+		slog.Info("request completed",
+			"service", serviceName,
+			"correlation_id", getCorrelationID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.statusCode,
+			"duration_ms", duration.Milliseconds(),
+		)
+	})
 }
 
 func migrate() {
@@ -117,9 +182,9 @@ func migrate() {
 		unit_price DECIMAL(10,2) NOT NULL
 	);`
 	if _, err := db.Exec(schema); err != nil {
-		log.Printf("Migration warning: %v", err)
+		slog.Warn("migration warning", "service", serviceName, "error", err.Error())
 	}
-	log.Println("Database migrated")
+	slog.Info("migration completed", "service", serviceName)
 }
 
 func connectRabbitMQ() {
@@ -134,19 +199,19 @@ func connectRabbitMQ() {
 				// Declare exchange
 				err = rabbitCh.ExchangeDeclare("orders", "topic", true, false, false, false, nil)
 				if err == nil {
-					log.Println("RabbitMQ connected")
+					slog.Info("rabbitmq connected", "service", serviceName)
 					return
 				}
 			}
 		}
-		log.Printf("Waiting for RabbitMQ... (%d/30): %v", i+1, err)
+		slog.Info("waiting for rabbitmq", "service", serviceName, "attempt", i+1, "max_attempts", 30, "error", err.Error())
 		time.Sleep(time.Second)
 	}
-	log.Println("Warning: RabbitMQ not connected, events won't be published")
+	slog.Warn("rabbitmq not connected, events won't be published", "service", serviceName)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "order-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
@@ -155,15 +220,25 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": "order-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
 func createOrderHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
 	var req CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
+
+	slog.Info("saga started",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"user_id", req.UserID,
+		"item_count", len(req.Items),
+	)
 
 	// SAGA Step 1: Get product info and reserve inventory
 	var items []OrderItem
@@ -172,19 +247,38 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, item := range req.Items {
 		// Get product info
-		product, err := getProduct(item.ProductID)
+		product, err := getProduct(ctx, item.ProductID)
 		if err != nil {
-			releaseReservedStock(reservedProducts, req.Items)
+			slog.Warn("inventory reservation failed",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"product_id", item.ProductID,
+				"reason", "product not found",
+			)
+			releaseReservedStock(ctx, reservedProducts, req.Items)
 			http.Error(w, fmt.Sprintf(`{"error":"product not found: %s"}`, item.ProductID), http.StatusBadRequest)
 			return
 		}
 
 		// Reserve stock (decrement)
-		if err := updateStock(item.ProductID, -item.Quantity); err != nil {
-			releaseReservedStock(reservedProducts, req.Items)
+		if err := updateStock(ctx, item.ProductID, -item.Quantity); err != nil {
+			slog.Warn("inventory reservation failed",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"product_id", item.ProductID,
+				"reason", err.Error(),
+			)
+			releaseReservedStock(ctx, reservedProducts, req.Items)
 			http.Error(w, fmt.Sprintf(`{"error":"insufficient stock for product: %s"}`, product.Name), http.StatusConflict)
 			return
 		}
+
+		slog.Info("inventory reserved",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"product_id", item.ProductID,
+			"quantity", item.Quantity,
+		)
 
 		reservedProducts = append(reservedProducts, item.ProductID)
 		items = append(items, OrderItem{
@@ -198,11 +292,21 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 	// SAGA Step 2: Simulate payment (100ms delay, always succeeds for now)
 	time.Sleep(100 * time.Millisecond)
+	slog.Info("payment simulated",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"amount", totalAmount,
+	)
 
 	// SAGA Step 3: Create order in database
 	tx, err := db.Begin()
 	if err != nil {
-		releaseReservedStock(reservedProducts, req.Items)
+		slog.Error("order failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"reason", "database transaction failed",
+		)
+		releaseReservedStock(ctx, reservedProducts, req.Items)
 		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -214,7 +318,12 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	).Scan(&orderID)
 	if err != nil {
 		tx.Rollback()
-		releaseReservedStock(reservedProducts, req.Items)
+		slog.Error("order failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"reason", "failed to create order record",
+		)
+		releaseReservedStock(ctx, reservedProducts, req.Items)
 		http.Error(w, `{"error":"failed to create order"}`, http.StatusInternalServerError)
 		return
 	}
@@ -227,7 +336,13 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		).Scan(&itemID)
 		if err != nil {
 			tx.Rollback()
-			releaseReservedStock(reservedProducts, req.Items)
+			slog.Error("order failed",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"order_id", orderID,
+				"reason", "failed to create order items",
+			)
+			releaseReservedStock(ctx, reservedProducts, req.Items)
 			http.Error(w, `{"error":"failed to create order items"}`, http.StatusInternalServerError)
 			return
 		}
@@ -235,7 +350,13 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := tx.Commit(); err != nil {
-		releaseReservedStock(reservedProducts, req.Items)
+		slog.Error("order failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", orderID,
+			"reason", "failed to commit transaction",
+		)
+		releaseReservedStock(ctx, reservedProducts, req.Items)
 		http.Error(w, `{"error":"failed to commit order"}`, http.StatusInternalServerError)
 		return
 	}
@@ -251,15 +372,26 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:       time.Now(),
 	}
 
-	publishOrderConfirmed(order)
+	publishOrderConfirmed(ctx, order)
 
-	log.Printf("Order created: %s, total: %.2f", orderID, totalAmount)
+	slog.Info("order confirmed",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"order_id", orderID,
+		"total", totalAmount,
+	)
+
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(order)
 }
 
-func getProduct(productID string) (*Product, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/api/v1/products/%s", productServiceURL, productID))
+func getProduct(ctx context.Context, productID string) (*Product, error) {
+	correlationID := getCorrelationID(ctx)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/v1/products/%s", productServiceURL, productID), nil)
+	req.Header.Set("X-Correlation-ID", correlationID)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -276,10 +408,13 @@ func getProduct(productID string) (*Product, error) {
 	return &product, nil
 }
 
-func updateStock(productID string, quantity int) error {
+func updateStock(ctx context.Context, productID string, quantity int) error {
+	correlationID := getCorrelationID(ctx)
+
 	body, _ := json.Marshal(map[string]int{"quantity": quantity})
-	req, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/api/v1/products/%s/stock", productServiceURL, productID), bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "PATCH", fmt.Sprintf("%s/api/v1/products/%s/stock", productServiceURL, productID), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Correlation-ID", correlationID)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -296,35 +431,68 @@ func updateStock(productID string, quantity int) error {
 	return nil
 }
 
-func releaseReservedStock(productIDs []string, items []OrderItemRequest) {
+func releaseReservedStock(ctx context.Context, productIDs []string, items []OrderItemRequest) {
+	correlationID := getCorrelationID(ctx)
+
 	for i, pid := range productIDs {
 		if i < len(items) {
+			slog.Info("compensating transaction",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"product_id", pid,
+				"action", "releasing reserved stock",
+			)
 			// Release by adding back the quantity
-			if err := updateStock(pid, items[i].Quantity); err != nil {
-				log.Printf("Failed to release stock for %s: %v", pid, err)
+			if err := updateStock(ctx, pid, items[i].Quantity); err != nil {
+				slog.Error("compensation failed",
+					"service", serviceName,
+					"correlation_id", correlationID,
+					"product_id", pid,
+					"error", err.Error(),
+				)
 			}
 		}
 	}
 }
 
-func publishOrderConfirmed(order Order) {
+func publishOrderConfirmed(ctx context.Context, order Order) {
+	correlationID := getCorrelationID(ctx)
+
 	if rabbitCh == nil {
-		log.Println("RabbitMQ not connected, skipping event publish")
+		slog.Warn("rabbitmq not connected, skipping event publish",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", order.ID,
+		)
 		return
 	}
 
 	body, _ := json.Marshal(order)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := rabbitCh.PublishWithContext(ctx, "orders", "order.confirmed", false, false, amqp.Publishing{
+	err := rabbitCh.PublishWithContext(pubCtx, "orders", "order.confirmed", false, false, amqp.Publishing{
 		ContentType: "application/json",
 		Body:        body,
+		Headers: amqp.Table{
+			"X-Correlation-ID": correlationID,
+		},
 	})
 	if err != nil {
-		log.Printf("Failed to publish order event: %v", err)
+		slog.Error("event publish failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", order.ID,
+			"error", err.Error(),
+		)
 	} else {
-		log.Printf("Published order.confirmed event for order %s", order.ID)
+		slog.Info("event published",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"exchange", "orders",
+			"routing_key", "order.confirmed",
+			"order_id", order.ID,
+		)
 	}
 }
 

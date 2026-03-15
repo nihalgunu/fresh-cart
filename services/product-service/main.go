@@ -1,9 +1,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -14,6 +15,12 @@ import (
 	_ "github.com/lib/pq"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+const serviceName = "product-service"
+
+type contextKey string
+
+const correlationIDKey contextKey = "correlation_id"
 
 var db *sql.DB
 
@@ -42,10 +49,16 @@ type StockUpdateRequest struct {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	var err error
 	db, err = sql.Open("postgres", getEnv("DATABASE_URL", "postgres://freshcart:freshcart@localhost:5432/freshcart_products?sslmode=disable"))
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("database connection failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -53,7 +66,7 @@ func main() {
 		if err := db.Ping(); err == nil {
 			break
 		}
-		log.Printf("Waiting for database... (%d/30)", i+1)
+		slog.Info("waiting for database", "service", serviceName, "attempt", i+1, "max_attempts", 30)
 		time.Sleep(time.Second)
 	}
 
@@ -63,7 +76,8 @@ func main() {
 	go startRabbitMQConsumer()
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	r.Use(correlationIDMiddleware)
+	r.Use(requestLoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", healthHandler)
@@ -75,8 +89,60 @@ func main() {
 	r.Patch("/api/v1/products/{id}/stock", updateStockHandler)
 
 	port := getEnv("PORT", "8082")
-	log.Printf("Product service starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+	slog.Info("product-service starting", "service", serviceName, "port", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		slog.Error("server failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
+	}
+}
+
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationID := r.Header.Get("X-Correlation-ID")
+		if correlationID == "" {
+			correlationID = uuid.New().String()
+		}
+
+		ctx := context.WithValue(r.Context(), correlationIDKey, correlationID)
+		w.Header().Set("X-Correlation-ID", correlationID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func getCorrelationID(ctx context.Context) string {
+	if id, ok := ctx.Value(correlationIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+		slog.Info("request completed",
+			"service", serviceName,
+			"correlation_id", getCorrelationID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.statusCode,
+			"duration_ms", duration.Milliseconds(),
+		)
+	})
 }
 
 func migrate() {
@@ -94,9 +160,9 @@ func migrate() {
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 	);`
 	if _, err := db.Exec(schema); err != nil {
-		log.Printf("Migration warning: %v", err)
+		slog.Warn("migration warning", "service", serviceName, "error", err.Error())
 	}
-	log.Println("Database migrated")
+	slog.Info("migration completed", "service", serviceName)
 }
 
 func startRabbitMQConsumer() {
@@ -105,14 +171,21 @@ func startRabbitMQConsumer() {
 	for {
 		conn, err := amqp.Dial(rabbitURL)
 		if err != nil {
-			log.Printf("RabbitMQ connection failed, retrying in 5s: %v", err)
+			slog.Warn("rabbitmq connection failed, retrying",
+				"service", serviceName,
+				"retry_in", "5s",
+				"error", err.Error(),
+			)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		ch, err := conn.Channel()
 		if err != nil {
-			log.Printf("RabbitMQ channel failed: %v", err)
+			slog.Warn("rabbitmq channel failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			conn.Close()
 			time.Sleep(5 * time.Second)
 			continue
@@ -120,7 +193,10 @@ func startRabbitMQConsumer() {
 
 		q, err := ch.QueueDeclare("inventory.update", true, false, false, false, nil)
 		if err != nil {
-			log.Printf("Queue declare failed: %v", err)
+			slog.Warn("queue declare failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			ch.Close()
 			conn.Close()
 			time.Sleep(5 * time.Second)
@@ -129,15 +205,27 @@ func startRabbitMQConsumer() {
 
 		msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
 		if err != nil {
-			log.Printf("Consume failed: %v", err)
+			slog.Warn("consume failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			ch.Close()
 			conn.Close()
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		log.Println("RabbitMQ consumer started")
+		slog.Info("rabbitmq consumer started", "service", serviceName)
+
 		for msg := range msgs {
+			// Extract correlation ID from AMQP headers
+			correlationID := ""
+			if msg.Headers != nil {
+				if cid, ok := msg.Headers["X-Correlation-ID"].(string); ok {
+					correlationID = cid
+				}
+			}
+
 			var update struct {
 				ProductID      string `json:"product_id"`
 				QuantityChange int    `json:"quantity_change"`
@@ -145,24 +233,42 @@ func startRabbitMQConsumer() {
 				Action         string `json:"action"`
 			}
 			if err := json.Unmarshal(msg.Body, &update); err != nil {
-				log.Printf("Invalid message: %v", err)
+				slog.Warn("invalid message",
+					"service", serviceName,
+					"correlation_id", correlationID,
+					"error", err.Error(),
+				)
 				continue
 			}
-			log.Printf("Inventory update: product=%s, change=%d, action=%s", update.ProductID, update.QuantityChange, update.Action)
+
+			slog.Info("inventory update received",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"product_id", update.ProductID,
+				"action", update.Action,
+				"order_id", update.OrderID,
+				"quantity_change", update.QuantityChange,
+			)
+
 			_, err := db.Exec(`UPDATE products SET stock = stock + $1, updated_at = NOW() WHERE id = $2`, update.QuantityChange, update.ProductID)
 			if err != nil {
-				log.Printf("Stock update failed: %v", err)
+				slog.Error("stock update failed",
+					"service", serviceName,
+					"correlation_id", correlationID,
+					"product_id", update.ProductID,
+					"error", err.Error(),
+				)
 			}
 		}
 
-		log.Println("RabbitMQ connection lost, reconnecting...")
+		slog.Warn("rabbitmq connection lost, reconnecting", "service", serviceName)
 		ch.Close()
 		conn.Close()
 	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "product-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
@@ -171,7 +277,7 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": "product-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
 func listProductsHandler(w http.ResponseWriter, r *http.Request) {
@@ -213,6 +319,9 @@ func getProductHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func createProductHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
 	var req CreateProductRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -226,16 +335,30 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 		req.Name, req.Description, req.Price, req.Category, req.Stock, req.ImageURL,
 	).Scan(&p.ID, &p.Name, &p.Description, &p.Price, &p.Category, &p.Stock, &p.ImageURL, &p.CreatedAt)
 	if err != nil {
-		log.Printf("Create product error: %v", err)
+		slog.Error("create product failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"error", err.Error(),
+		)
 		http.Error(w, `{"error":"failed to create product"}`, http.StatusInternalServerError)
 		return
 	}
+
+	slog.Info("product created",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"product_id", p.ID,
+		"name", p.Name,
+	)
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(p)
 }
 
 func updateStockHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
 	id := chi.URLParam(r, "id")
 	if _, err := uuid.Parse(id); err != nil {
 		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
@@ -257,6 +380,13 @@ func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if currentStock+req.Quantity < 0 {
+		slog.Warn("insufficient stock",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"product_id", id,
+			"requested", -req.Quantity,
+			"available", currentStock,
+		)
 		http.Error(w, `{"error":"insufficient stock"}`, http.StatusConflict)
 		return
 	}
@@ -271,6 +401,15 @@ func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"failed to update stock"}`, http.StatusInternalServerError)
 		return
 	}
+
+	slog.Info("stock updated",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"product_id", id,
+		"old_stock", currentStock,
+		"new_stock", p.Stock,
+		"change", req.Quantity,
+	)
 
 	json.NewEncoder(w).Encode(p)
 }

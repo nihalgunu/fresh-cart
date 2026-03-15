@@ -3,18 +3,25 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+const serviceName = "notification-service"
+
+type contextKey string
+
+const correlationIDKey contextKey = "correlation_id"
 
 var mongoClient *mongo.Client
 var notificationsCollection *mongo.Collection
@@ -38,11 +45,17 @@ type OrderEvent struct {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
 	connectMongoDB()
 	go startRabbitMQConsumer()
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	r.Use(correlationIDMiddleware)
+	r.Use(requestLoggingMiddleware)
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", healthHandler)
@@ -50,8 +63,60 @@ func main() {
 	r.Get("/api/v1/notifications/user/{user_id}", listUserNotificationsHandler)
 
 	port := getEnv("PORT", "8084")
-	log.Printf("Notification service starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, r))
+	slog.Info("notification-service starting", "service", serviceName, "port", port)
+	if err := http.ListenAndServe(":"+port, r); err != nil {
+		slog.Error("server failed", "service", serviceName, "error", err.Error())
+		os.Exit(1)
+	}
+}
+
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationID := r.Header.Get("X-Correlation-ID")
+		if correlationID == "" {
+			correlationID = uuid.New().String()
+		}
+
+		ctx := context.WithValue(r.Context(), correlationIDKey, correlationID)
+		w.Header().Set("X-Correlation-ID", correlationID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func getCorrelationID(ctx context.Context) string {
+	if id, ok := ctx.Value(correlationIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func requestLoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+		slog.Info("request completed",
+			"service", serviceName,
+			"correlation_id", getCorrelationID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.statusCode,
+			"duration_ms", duration.Milliseconds(),
+		)
+	})
 }
 
 func connectMongoDB() {
@@ -69,12 +134,12 @@ func connectMongoDB() {
 				break
 			}
 		}
-		log.Printf("Waiting for MongoDB... (%d/30): %v", i+1, err)
+		slog.Info("waiting for mongodb", "service", serviceName, "attempt", i+1, "max_attempts", 30, "error", err.Error())
 		time.Sleep(time.Second)
 	}
 
 	notificationsCollection = mongoClient.Database(dbName).Collection("notifications")
-	log.Println("MongoDB connected")
+	slog.Info("mongodb connected", "service", serviceName)
 }
 
 func startRabbitMQConsumer() {
@@ -83,14 +148,21 @@ func startRabbitMQConsumer() {
 	for {
 		conn, err := amqp.Dial(rabbitURL)
 		if err != nil {
-			log.Printf("RabbitMQ connection failed, retrying in 5s: %v", err)
+			slog.Warn("rabbitmq connection failed, retrying",
+				"service", serviceName,
+				"retry_in", "5s",
+				"error", err.Error(),
+			)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		ch, err := conn.Channel()
 		if err != nil {
-			log.Printf("RabbitMQ channel failed: %v", err)
+			slog.Warn("rabbitmq channel failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			conn.Close()
 			time.Sleep(5 * time.Second)
 			continue
@@ -99,7 +171,10 @@ func startRabbitMQConsumer() {
 		// Declare exchange
 		err = ch.ExchangeDeclare("orders", "topic", true, false, false, false, nil)
 		if err != nil {
-			log.Printf("Exchange declare failed: %v", err)
+			slog.Warn("exchange declare failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			ch.Close()
 			conn.Close()
 			time.Sleep(5 * time.Second)
@@ -109,7 +184,10 @@ func startRabbitMQConsumer() {
 		// Declare queue
 		q, err := ch.QueueDeclare("notifications.order", true, false, false, false, nil)
 		if err != nil {
-			log.Printf("Queue declare failed: %v", err)
+			slog.Warn("queue declare failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			ch.Close()
 			conn.Close()
 			time.Sleep(5 * time.Second)
@@ -119,7 +197,10 @@ func startRabbitMQConsumer() {
 		// Bind queue to exchange
 		err = ch.QueueBind(q.Name, "order.confirmed", "orders", false, nil)
 		if err != nil {
-			log.Printf("Queue bind failed: %v", err)
+			slog.Warn("queue bind failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			ch.Close()
 			conn.Close()
 			time.Sleep(5 * time.Second)
@@ -128,23 +209,43 @@ func startRabbitMQConsumer() {
 
 		msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
 		if err != nil {
-			log.Printf("Consume failed: %v", err)
+			slog.Warn("consume failed",
+				"service", serviceName,
+				"error", err.Error(),
+			)
 			ch.Close()
 			conn.Close()
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		log.Println("RabbitMQ consumer started, listening for order.confirmed events")
+		slog.Info("rabbitmq consumer started", "service", serviceName)
 
 		for msg := range msgs {
+			// Extract correlation ID from AMQP headers
+			correlationID := ""
+			if msg.Headers != nil {
+				if cid, ok := msg.Headers["X-Correlation-ID"].(string); ok {
+					correlationID = cid
+				}
+			}
+
 			var order OrderEvent
 			if err := json.Unmarshal(msg.Body, &order); err != nil {
-				log.Printf("Invalid message: %v", err)
+				slog.Warn("invalid message",
+					"service", serviceName,
+					"correlation_id", correlationID,
+					"error", err.Error(),
+				)
 				continue
 			}
 
-			log.Printf("Sending confirmation email to user %s for order %s", order.UserID, order.ID)
+			slog.Info("order event received",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"order_id", order.ID,
+				"user_id", order.UserID,
+			)
 
 			notification := Notification{
 				OrderID:   order.ID,
@@ -159,20 +260,31 @@ func startRabbitMQConsumer() {
 			_, err := notificationsCollection.InsertOne(ctx, notification)
 			cancel()
 			if err != nil {
-				log.Printf("Failed to store notification: %v", err)
+				slog.Error("notification store failed",
+					"service", serviceName,
+					"correlation_id", correlationID,
+					"order_id", order.ID,
+					"error", err.Error(),
+				)
 			} else {
-				log.Printf("Notification stored for order %s", order.ID)
+				slog.Info("notification stored",
+					"service", serviceName,
+					"correlation_id", correlationID,
+					"order_id", order.ID,
+					"user_id", order.UserID,
+					"type", "order_confirmed",
+				)
 			}
 		}
 
-		log.Println("RabbitMQ connection lost, reconnecting...")
+		slog.Warn("rabbitmq connection lost, reconnecting", "service", serviceName)
 		ch.Close()
 		conn.Close()
 	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "notification-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
@@ -184,7 +296,7 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": "notification-service"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
 func listUserNotificationsHandler(w http.ResponseWriter, r *http.Request) {
