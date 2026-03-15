@@ -88,3 +88,138 @@
 ### Documentation
 - README.md with architecture diagram, port table, API docs, testing instructions
 - completed.md (this file) tracking implemented features
+
+---
+
+## Phase 3: Production Readiness & Observability
+
+### Health & Readiness Endpoints
+- `/health` - Liveness check on all services (returns 200 OK)
+- `/ready` - Readiness check with dependency verification:
+  - User Service: PostgreSQL connection
+  - Product Service: PostgreSQL + RabbitMQ connection
+  - Order Service: PostgreSQL + RabbitMQ connection
+  - Notification Service: MongoDB + RabbitMQ connection
+  - API Gateway: Redis connection
+
+### Prometheus Metrics
+- **HTTP Metrics** (all services):
+  - `http_requests_total` - Request counter by method, path, status
+- **Business Metrics**:
+  - `users_registered_total` - User registration counter
+  - `orders_created_total` - Order creation counter
+  - `inventory_level` - Current stock gauge per product
+  - `notifications_sent_total` - Notification counter by type
+
+### Rate Limiting (API Gateway)
+- Redis-backed sliding window rate limiter
+- Configurable via environment variables:
+  - `RATE_LIMIT_RPS` - Requests per second (default: 100)
+  - `RATE_LIMIT_BURST` - Burst allowance (default: 200)
+- Returns 429 Too Many Requests when exceeded
+
+### JWT Authentication
+- Protected routes require `Authorization: Bearer <token>` header
+- Public routes: `/health`, `/ready`, `/metrics`, `/api/v1/auth/*`
+- Returns 401 Unauthorized for missing/invalid tokens
+
+### Order State Machine
+- Valid state transitions:
+  - `pending` → `confirmed` (via saga)
+  - `confirmed` → `packing`
+  - `packing` → `out_for_delivery`
+  - `out_for_delivery` → `delivered`
+  - `confirmed` → `cancelled` (triggers stock release)
+- Invalid transitions return 400 Bad Request
+- State changes publish events to RabbitMQ
+
+### Notification Types
+- `order_confirmed` - Order successfully placed
+- `order_packing` - Order being prepared
+- `order_out_for_delivery` - Order dispatched
+- `order_delivered` - Order completed
+- `order_cancelled` - Order cancelled
+
+### Saga Compensation
+- Multi-item order with partial failure triggers rollback
+- Stock reservations for successful items are released
+- Order fails atomically (no partial orders)
+
+---
+
+## Integration Test Suite
+
+### Test Script (`scripts/test-all.sh`)
+Comprehensive integration test with 61 test cases covering:
+
+### Health & Readiness (10 tests)
+- Health check for all 5 services
+- Ready check for all 5 services (including Redis for gateway)
+
+### Prometheus Metrics (9 tests)
+- HTTP metrics (`http_requests_total`) on all services
+- Business metrics: `users_registered_total`, `orders_created_total`, `inventory_level`, `notifications_sent_total`
+
+### Authentication (9 tests)
+- User registration returns 201 with JWT token and user ID
+- Login returns 200
+- Duplicate registration returns 409
+- Bad login returns 401
+- Login token works on protected routes
+- Protected routes return 401 without token
+- Protected routes return 200 with valid token
+
+### User Profile (3 tests)
+- Get user profile returns 200
+- User profile excludes `password_hash` field
+- Nonexistent user returns 404
+
+### Product CRUD (3 tests)
+- Create product returns 201 with ID
+- Get product returns 200
+
+### Order Saga (3 tests)
+- Place order returns 201
+- Order status is `confirmed`
+- Stock decremented correctly
+
+### Order Retrieval (4 tests)
+- Get order by ID returns 200
+- Order contains items
+- List user orders returns 200
+- User has orders
+
+### Order State Machine (5 tests)
+- `confirmed` → `packing` returns 200
+- `packing` → `out_for_delivery` returns 200
+- `out_for_delivery` → `delivered` returns 200
+- Invalid transition (`delivered` → `pending`) returns 400
+
+### Cancellation & Stock Release (2 tests)
+- Cancel order returns 200
+- Stock restored after cancellation
+
+### Saga Compensation (2 tests)
+- Order with insufficient stock fails (not 200/201)
+- First item reservation rolled back (stock unchanged)
+
+### Notifications (6 tests)
+- Notifications exist for user
+- Notification types exist: `order_confirmed`, `order_packing`, `order_out_for_delivery`, `order_delivered`, `order_cancelled`
+
+### Structured Logging (1 test)
+- Gateway logs are valid JSON
+
+### Correlation ID (4 tests)
+- Correlation ID echoed in response header
+- Correlation ID found in 3+ service logs
+- Auto-generated correlation ID when none sent
+- Auto-generated correlation ID is valid UUID
+
+### Rate Limiting (1 test)
+- Parallel requests trigger 429 response
+
+### Running Tests
+```bash
+make test-all
+```

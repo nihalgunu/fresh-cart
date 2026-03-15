@@ -1,4 +1,4 @@
-.PHONY: build up down logs seed test-e2e clean boot
+.PHONY: build up down logs seed test-e2e clean boot test-all
 
 build:
 	docker compose build
@@ -50,3 +50,6 @@ test-e2e:
 		-d '{"name":"Test Avocados","description":"Test","price":4.99,"category":"produce","stock":10}' | jq .
 	@echo ""
 	@echo "Run 'make seed' to seed data, then place an order with the IDs"
+
+test-all:
+	@bash scripts/test-all.sh

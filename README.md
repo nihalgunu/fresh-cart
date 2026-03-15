@@ -17,11 +17,12 @@ Order Service → RabbitMQ (5672) → Notification Service (8084)
 
 | Service              | Port  | Database      | Description                          |
 |---------------------|-------|---------------|--------------------------------------|
-| API Gateway         | 8000  | -             | Reverse proxy, routes to services    |
+| API Gateway         | 8000  | Redis         | Reverse proxy, rate limiting, auth   |
 | User Service        | 8081  | PostgreSQL    | Registration, login, JWT             |
 | Product Service     | 8082  | PostgreSQL    | Catalog CRUD, inventory management   |
 | Order Service       | 8083  | PostgreSQL    | Order placement, saga orchestration  |
 | Notification Service| 8084  | MongoDB       | Event-driven notifications           |
+| Redis               | 6379  | -             | Rate limiting storage                |
 | RabbitMQ            | 5672  | -             | Message broker                       |
 | RabbitMQ Management | 15672 | -             | Web UI (guest/guest)                 |
 

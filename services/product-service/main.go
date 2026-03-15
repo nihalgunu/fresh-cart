@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -23,6 +26,48 @@ type contextKey string
 const correlationIDKey contextKey = "correlation_id"
 
 var db *sql.DB
+
+var (
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "path", "status"},
+	)
+
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+
+	inventoryLevel = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "inventory_level",
+			Help: "Current inventory level for products",
+		},
+		[]string{"product_id"},
+	)
+
+	inventoryUpdatesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "inventory_updates_total",
+			Help: "Total number of inventory updates",
+		},
+		[]string{"product_id", "action"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(inventoryLevel)
+	prometheus.MustRegister(inventoryUpdatesTotal)
+}
 
 type Product struct {
 	ID          string    `json:"id"`
@@ -72,13 +117,20 @@ func main() {
 
 	migrate()
 
+	// Initialize inventory metrics from existing products
+	initInventoryMetrics()
+
 	// Start RabbitMQ consumer in background
 	go startRabbitMQConsumer()
 
 	r := chi.NewRouter()
 	r.Use(correlationIDMiddleware)
 	r.Use(requestLoggingMiddleware)
+	r.Use(metricsMiddleware)
 	r.Use(middleware.Recoverer)
+
+	// Metrics endpoint
+	r.Handle("/metrics", promhttp.Handler())
 
 	r.Get("/health", healthHandler)
 	r.Get("/ready", readyHandler)
@@ -93,6 +145,24 @@ func main() {
 	if err := http.ListenAndServe(":"+port, r); err != nil {
 		slog.Error("server failed", "service", serviceName, "error", err.Error())
 		os.Exit(1)
+	}
+}
+
+func initInventoryMetrics() {
+	rows, err := db.Query(`SELECT id, stock FROM products`)
+	if err != nil {
+		slog.Warn("failed to initialize inventory metrics", "service", serviceName, "error", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var stock int
+		if err := rows.Scan(&id, &stock); err != nil {
+			continue
+		}
+		inventoryLevel.WithLabelValues(id).Set(float64(stock))
 	}
 }
 
@@ -142,6 +212,24 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
 		)
+	})
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start).Seconds()
+		httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(wrapped.statusCode)).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration)
 	})
 }
 
@@ -250,7 +338,7 @@ func startRabbitMQConsumer() {
 				"quantity_change", update.QuantityChange,
 			)
 
-			_, err := db.Exec(`UPDATE products SET stock = stock + $1, updated_at = NOW() WHERE id = $2`, update.QuantityChange, update.ProductID)
+			result, err := db.Exec(`UPDATE products SET stock = stock + $1, updated_at = NOW() WHERE id = $2`, update.QuantityChange, update.ProductID)
 			if err != nil {
 				slog.Error("stock update failed",
 					"service", serviceName,
@@ -258,6 +346,13 @@ func startRabbitMQConsumer() {
 					"product_id", update.ProductID,
 					"error", err.Error(),
 				)
+			} else if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+				// Update inventory gauge
+				var newStock int
+				if err := db.QueryRow(`SELECT stock FROM products WHERE id = $1`, update.ProductID).Scan(&newStock); err == nil {
+					inventoryLevel.WithLabelValues(update.ProductID).Set(float64(newStock))
+				}
+				inventoryUpdatesTotal.WithLabelValues(update.ProductID, update.Action).Inc()
 			}
 		}
 
@@ -344,6 +439,10 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update inventory metrics
+	inventoryLevel.WithLabelValues(p.ID).Set(float64(p.Stock))
+	inventoryUpdatesTotal.WithLabelValues(p.ID, "create").Inc()
+
 	slog.Info("product created",
 		"service", serviceName,
 		"correlation_id", correlationID,
@@ -401,6 +500,16 @@ func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"failed to update stock"}`, http.StatusInternalServerError)
 		return
 	}
+
+	// Update inventory metrics
+	inventoryLevel.WithLabelValues(id).Set(float64(p.Stock))
+	action := "manual_update"
+	if req.Quantity < 0 {
+		action = "reserve"
+	} else {
+		action = "release"
+	}
+	inventoryUpdatesTotal.WithLabelValues(id, action).Inc()
 
 	slog.Info("stock updated",
 		"service", serviceName,

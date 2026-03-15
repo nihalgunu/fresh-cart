@@ -8,10 +8,28 @@ services:
       - USER_SERVICE_URL=http://user-service:8081
       - PRODUCT_SERVICE_URL=http://product-service:8082
       - ORDER_SERVICE_URL=http://order-service:8083
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8084
+      - JWT_SECRET=freshcart-dev-secret
+      - REDIS_URL=redis://redis:6379
+      - RATE_LIMIT_RPS=100
+      - RATE_LIMIT_BURST=200
     depends_on:
       - user-service
       - product-service
       - order-service
+      - redis
+    networks:
+      - freshcart
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     networks:
       - freshcart
 

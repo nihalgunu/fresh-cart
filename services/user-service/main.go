@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,6 +15,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -25,6 +28,38 @@ const correlationIDKey contextKey = "correlation_id"
 
 var db *sql.DB
 var jwtSecret []byte
+
+var (
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "path", "status"},
+	)
+
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+
+	usersRegisteredTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "users_registered_total",
+			Help: "Total number of users registered",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(usersRegisteredTotal)
+}
 
 type User struct {
 	ID              string    `json:"id"`
@@ -82,7 +117,11 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(correlationIDMiddleware)
 	r.Use(requestLoggingMiddleware)
+	r.Use(metricsMiddleware)
 	r.Use(middleware.Recoverer)
+
+	// Metrics endpoint
+	r.Handle("/metrics", promhttp.Handler())
 
 	r.Get("/health", healthHandler)
 	r.Get("/ready", readyHandler)
@@ -145,6 +184,24 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
 		)
+	})
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start).Seconds()
+		httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(wrapped.statusCode)).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration)
 	})
 }
 
@@ -212,6 +269,9 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := generateToken(id, req.Email)
+
+	// Increment users registered counter
+	usersRegisteredTotal.Inc()
 
 	slog.Info("user registered",
 		"service", serviceName,

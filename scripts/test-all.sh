@@ -1,0 +1,371 @@
+#!/bin/bash
+set -o pipefail
+
+GATEWAY="http://localhost:8000"
+USER_SVC="http://localhost:8081"
+PRODUCT_SVC="http://localhost:8082"
+ORDER_SVC="http://localhost:8083"
+NOTIF_SVC="http://localhost:8084"
+
+PASS=0
+FAIL=0
+CORRELATION_ID="full-test-$(date +%s)"
+
+green() { echo -e "\033[32m  PASS: $1\033[0m"; PASS=$((PASS+1)); }
+red() { echo -e "\033[31m  FAIL: $1\033[0m"; FAIL=$((FAIL+1)); }
+check() {
+  if [ "$1" = "true" ]; then green "$2"; else red "$2"; fi
+}
+
+echo "============================================"
+echo "  FreshCart Full Integration Test"
+echo "  Correlation ID: $CORRELATION_ID"
+echo "============================================"
+echo ""
+
+# ---- HEALTH CHECKS ----
+echo "--- Health Checks ---"
+for svc in "$GATEWAY" "$USER_SVC" "$PRODUCT_SVC" "$ORDER_SVC" "$NOTIF_SVC"; do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$svc/health")
+  check "$([ "$STATUS" = "200" ] && echo true)" "Health $svc → $STATUS"
+done
+
+# ---- READY CHECKS ----
+echo ""
+echo "--- Ready Checks ---"
+for svc in "$USER_SVC" "$PRODUCT_SVC" "$ORDER_SVC" "$NOTIF_SVC"; do
+  BODY=$(curl -s "$svc/ready")
+  STATUS=$(echo "$BODY" | jq -r '.status // empty' 2>/dev/null)
+  check "$([ "$STATUS" = "ready" ] && echo true)" "Ready $svc → $STATUS"
+done
+
+# Gateway ready (should check Redis)
+GW_READY=$(curl -s "$GATEWAY/ready")
+GW_STATUS=$(echo "$GW_READY" | jq -r '.status // empty' 2>/dev/null)
+check "$([ "$GW_STATUS" = "ready" ] && echo true)" "Ready gateway → $GW_STATUS"
+
+# ---- PROMETHEUS METRICS (HTTP) ----
+echo ""
+echo "--- Prometheus Metrics (HTTP) ---"
+for port in 8000 8081 8082 8083 8084; do
+  METRICS=$(curl -s "http://localhost:$port/metrics" | grep -c "http_requests_total" 2>/dev/null)
+  check "$([ "$METRICS" -gt 0 ] && echo true)" "Metrics localhost:$port has http_requests_total"
+done
+
+# ---- AUTH: PUBLIC ROUTES ----
+echo ""
+echo "--- Auth: Public Routes ---"
+REG_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GATEWAY/api/v1/auth/register" \
+  -H "Content-Type: application/json" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d "{\"email\":\"testuser-$CORRELATION_ID@test.com\",\"password\":\"password123\",\"name\":\"Test User\",\"delivery_address\":\"789 Test Ave\"}")
+REG_CODE=$(echo "$REG_RESPONSE" | tail -1)
+REG_BODY=$(echo "$REG_RESPONSE" | head -1)
+check "$([ "$REG_CODE" = "201" ] && echo true)" "Register via gateway → $REG_CODE"
+
+TOKEN=$(echo "$REG_BODY" | jq -r '.token // empty' 2>/dev/null)
+USER_ID=$(echo "$REG_BODY" | jq -r '.id // empty' 2>/dev/null)
+check "$([ -n "$TOKEN" ] && echo true)" "Register returned JWT token"
+check "$([ -n "$USER_ID" ] && echo true)" "Register returned user ID"
+
+LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$GATEWAY/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"testuser-$CORRELATION_ID@test.com\",\"password\":\"password123\"}")
+check "$([ "$LOGIN_CODE" = "200" ] && echo true)" "Login via gateway → $LOGIN_CODE"
+
+# ---- AUTH: EDGE CASES ----
+echo ""
+echo "--- Auth: Edge Cases ---"
+
+# Duplicate registration returns 409
+DUP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$GATEWAY/api/v1/auth/register" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"testuser-$CORRELATION_ID@test.com\",\"password\":\"password123\",\"name\":\"Dup User\",\"delivery_address\":\"789 Test Ave\"}")
+check "$([ "$DUP_CODE" = "409" ] && echo true)" "Duplicate registration → $DUP_CODE (expect 409)"
+
+# Bad login returns 401
+BAD_LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$GATEWAY/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"nobody@test.com","password":"wrongpassword"}')
+check "$([ "$BAD_LOGIN_CODE" = "401" ] && echo true)" "Bad login → $BAD_LOGIN_CODE (expect 401)"
+
+# Login returns a working token
+LOGIN_RESPONSE=$(curl -s -X POST "$GATEWAY/api/v1/auth/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"email\":\"testuser-$CORRELATION_ID@test.com\",\"password\":\"password123\"}")
+LOGIN_TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.token // empty' 2>/dev/null)
+LOGIN_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $LOGIN_TOKEN" "$GATEWAY/api/v1/products")
+check "$([ "$LOGIN_AUTH_CODE" = "200" ] && echo true)" "Login token works on protected route → $LOGIN_AUTH_CODE (expect 200)"
+
+# ---- AUTH: PROTECTED ROUTES ----
+echo ""
+echo "--- Auth: Protected Routes ---"
+NO_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$GATEWAY/api/v1/products")
+check "$([ "$NO_AUTH_CODE" = "401" ] && echo true)" "Products without token → $NO_AUTH_CODE (expect 401)"
+
+WITH_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/products")
+check "$([ "$WITH_AUTH_CODE" = "200" ] && echo true)" "Products with token → $WITH_AUTH_CODE (expect 200)"
+
+# ---- USER PROFILE ----
+echo ""
+echo "--- User Profile ---"
+
+# GET user by ID
+USER_PROFILE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/users/$USER_ID")
+check "$([ "$USER_PROFILE_CODE" = "200" ] && echo true)" "Get user profile → $USER_PROFILE_CODE (expect 200)"
+
+# User profile does not contain password_hash
+USER_PROFILE=$(curl -s -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/users/$USER_ID")
+HAS_PASSWORD=$(echo "$USER_PROFILE" | jq 'has("password_hash")' 2>/dev/null)
+check "$([ "$HAS_PASSWORD" = "false" ] && echo true)" "User profile excludes password_hash → $HAS_PASSWORD (expect false)"
+
+# Nonexistent user returns 404
+FAKE_USER_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/users/00000000-0000-0000-0000-000000000000")
+check "$([ "$FAKE_USER_CODE" = "404" ] && echo true)" "Nonexistent user → $FAKE_USER_CODE (expect 404)"
+
+# ---- PRODUCT CRUD ----
+echo ""
+echo "--- Product CRUD ---"
+PRODUCT_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GATEWAY/api/v1/products" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d '{"name":"Test Avocados","description":"Ripe avocados","price":5.99,"category":"produce","stock":50}')
+PRODUCT_CODE=$(echo "$PRODUCT_RESPONSE" | tail -1)
+PRODUCT_BODY=$(echo "$PRODUCT_RESPONSE" | head -1)
+PRODUCT_ID=$(echo "$PRODUCT_BODY" | jq -r '.id // empty' 2>/dev/null)
+check "$([ "$PRODUCT_CODE" = "201" ] && echo true)" "Create product → $PRODUCT_CODE"
+check "$([ -n "$PRODUCT_ID" ] && echo true)" "Product has ID"
+
+GET_PRODUCT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/products/$PRODUCT_ID")
+check "$([ "$GET_PRODUCT_CODE" = "200" ] && echo true)" "Get product → $GET_PRODUCT_CODE"
+
+# ---- ORDER SAGA (end-to-end) ----
+echo ""
+echo "--- Order Saga ---"
+ORDER_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$GATEWAY/api/v1/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d "{\"user_id\":\"$USER_ID\",\"delivery_address\":\"123 Test St\",\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":2}]}")
+ORDER_CODE=$(echo "$ORDER_RESPONSE" | tail -1)
+ORDER_BODY=$(echo "$ORDER_RESPONSE" | head -1)
+ORDER_ID=$(echo "$ORDER_BODY" | jq -r '.id // empty' 2>/dev/null)
+ORDER_STATUS=$(echo "$ORDER_BODY" | jq -r '.status // empty' 2>/dev/null)
+check "$([ "$ORDER_CODE" = "201" ] || [ "$ORDER_CODE" = "200" ] && echo true)" "Place order → $ORDER_CODE"
+check "$([ "$ORDER_STATUS" = "confirmed" ] && echo true)" "Order status → $ORDER_STATUS (expect confirmed)"
+
+# Verify stock decremented
+STOCK=$(curl -s -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/products/$PRODUCT_ID" | jq -r '.stock // empty' 2>/dev/null)
+check "$([ "$STOCK" = "48" ] && echo true)" "Stock decremented → $STOCK (expect 48)"
+
+# ---- ORDER RETRIEVAL ----
+echo ""
+echo "--- Order Retrieval ---"
+
+# GET single order
+GET_ORDER_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/orders/$ORDER_ID")
+check "$([ "$GET_ORDER_CODE" = "200" ] && echo true)" "Get order by ID → $GET_ORDER_CODE (expect 200)"
+
+# Order has items
+ORDER_ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/orders/$ORDER_ID" | jq '.items | length' 2>/dev/null)
+check "$([ "$ORDER_ITEMS" -gt 0 ] && echo true)" "Order has items → count: $ORDER_ITEMS"
+
+# List orders for user
+USER_ORDERS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/orders/user/$USER_ID")
+check "$([ "$USER_ORDERS_CODE" = "200" ] && echo true)" "List user orders → $USER_ORDERS_CODE (expect 200)"
+
+USER_ORDERS_COUNT=$(curl -s -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/orders/user/$USER_ID" | jq 'length' 2>/dev/null)
+check "$([ "$USER_ORDERS_COUNT" -ge 1 ] && echo true)" "User has orders → count: $USER_ORDERS_COUNT"
+
+# ---- ORDER STATE MACHINE ----
+echo ""
+echo "--- Order State Machine ---"
+
+# confirmed → packing
+PACK_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$GATEWAY/api/v1/orders/$ORDER_ID/status" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d '{"status":"packing"}')
+check "$([ "$PACK_CODE" = "200" ] && echo true)" "confirmed → packing → $PACK_CODE"
+
+# packing → out_for_delivery
+OFD_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$GATEWAY/api/v1/orders/$ORDER_ID/status" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d '{"status":"out_for_delivery"}')
+check "$([ "$OFD_CODE" = "200" ] && echo true)" "packing → out_for_delivery → $OFD_CODE"
+
+# out_for_delivery → delivered
+DEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$GATEWAY/api/v1/orders/$ORDER_ID/status" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d '{"status":"delivered"}')
+check "$([ "$DEL_CODE" = "200" ] && echo true)" "out_for_delivery → delivered → $DEL_CODE"
+
+# Invalid transition: delivered → pending
+INVALID_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$GATEWAY/api/v1/orders/$ORDER_ID/status" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status":"pending"}')
+check "$([ "$INVALID_CODE" = "400" ] && echo true)" "delivered → pending rejected → $INVALID_CODE (expect 400)"
+
+# ---- CANCELLATION + STOCK RELEASE ----
+echo ""
+echo "--- Cancellation + Stock Release ---"
+ORDER2_RESPONSE=$(curl -s -X POST "$GATEWAY/api/v1/orders" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Correlation-ID: $CORRELATION_ID" \
+  -d "{\"user_id\":\"$USER_ID\",\"delivery_address\":\"123 Test St\",\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":5}]}")
+ORDER2_ID=$(echo "$ORDER2_RESPONSE" | jq -r '.id // empty' 2>/dev/null)
+
+STOCK_BEFORE=$(curl -s -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/products/$PRODUCT_ID" | jq -r '.stock // empty' 2>/dev/null)
+
+CANCEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$GATEWAY/api/v1/orders/$ORDER2_ID/status" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status":"cancelled"}')
+check "$([ "$CANCEL_CODE" = "200" ] && echo true)" "Cancel order → $CANCEL_CODE"
+
+sleep 1
+STOCK_AFTER=$(curl -s -H "Authorization: Bearer $TOKEN" "$GATEWAY/api/v1/products/$PRODUCT_ID" | jq -r '.stock // empty' 2>/dev/null)
+EXPECTED_STOCK=$((STOCK_BEFORE + 5))
+check "$([ "$STOCK_AFTER" = "$EXPECTED_STOCK" ] && echo true)" "Stock restored after cancel → $STOCK_AFTER (expect $EXPECTED_STOCK)"
+
+# ---- SAGA COMPENSATION ON FAILURE ----
+echo ""
+echo "--- Saga Compensation on Failure ---"
+
+# Create a low-stock product
+LOW_STOCK_RESPONSE=$(curl -s -X POST "$PRODUCT_SVC/api/v1/products" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Rare Truffle","description":"Very limited","price":99.99,"category":"produce","stock":1}')
+LOW_STOCK_ID=$(echo "$LOW_STOCK_RESPONSE" | jq -r '.id // empty' 2>/dev/null)
+
+# Create a normal product
+NORMAL_RESPONSE=$(curl -s -X POST "$PRODUCT_SVC/api/v1/products" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Regular Apple","description":"Plenty in stock","price":1.99,"category":"produce","stock":50}')
+NORMAL_ID=$(echo "$NORMAL_RESPONSE" | jq -r '.id // empty' 2>/dev/null)
+
+# Order both — first should reserve fine, second should fail (quantity 5 > stock 1)
+# The saga should roll back the first reservation
+NORMAL_STOCK_BEFORE=$(curl -s "$PRODUCT_SVC/api/v1/products/$NORMAL_ID" | jq -r '.stock' 2>/dev/null)
+
+FAIL_ORDER_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ORDER_SVC/api/v1/orders" \
+  -H "Content-Type: application/json" \
+  -H "X-Correlation-ID: saga-fail-test" \
+  -d "{\"user_id\":\"$USER_ID\",\"delivery_address\":\"123 Test St\",\"items\":[{\"product_id\":\"$NORMAL_ID\",\"quantity\":3},{\"product_id\":\"$LOW_STOCK_ID\",\"quantity\":5}]}")
+check "$([ "$FAIL_ORDER_CODE" != "200" ] && [ "$FAIL_ORDER_CODE" != "201" ] && echo true)" "Order with insufficient stock fails → $FAIL_ORDER_CODE"
+
+sleep 1
+NORMAL_STOCK_AFTER=$(curl -s "$PRODUCT_SVC/api/v1/products/$NORMAL_ID" | jq -r '.stock' 2>/dev/null)
+check "$([ "$NORMAL_STOCK_AFTER" = "$NORMAL_STOCK_BEFORE" ] && echo true)" "Saga rolled back first item reservation → stock $NORMAL_STOCK_AFTER (expect $NORMAL_STOCK_BEFORE)"
+
+# ---- NOTIFICATIONS (async) ----
+echo ""
+echo "--- Notifications ---"
+sleep 3
+NOTIFS=$(curl -s "$NOTIF_SVC/api/v1/notifications/user/$USER_ID")
+NOTIF_COUNT=$(echo "$NOTIFS" | jq 'length' 2>/dev/null)
+check "$([ "$NOTIF_COUNT" -gt 0 ] && echo true)" "Notifications exist → count: $NOTIF_COUNT"
+
+NOTIF_TYPES=$(echo "$NOTIFS" | jq -r '.[].type' 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+echo "  Notification types found: $NOTIF_TYPES"
+
+# ---- NOTIFICATION TYPES FOR STATE TRANSITIONS ----
+echo ""
+echo "--- Notification Types for State Transitions ---"
+# We transitioned the first order through confirmed → packing → out_for_delivery → delivered
+# And the second order through confirmed → cancelled
+# Each should have generated a notification
+
+NOTIF_TYPES=$(curl -s "$NOTIF_SVC/api/v1/notifications/user/$USER_ID" | jq -r '.[].type' 2>/dev/null | sort -u)
+
+for expected_type in "order_confirmed" "order_packing" "order_out_for_delivery" "order_delivered" "order_cancelled"; do
+  FOUND=$(echo "$NOTIF_TYPES" | grep -c "$expected_type" 2>/dev/null)
+  check "$([ "$FOUND" -gt 0 ] && echo true)" "Notification type exists: $expected_type"
+done
+
+# ---- PROMETHEUS METRICS (Business) ----
+echo ""
+echo "--- Prometheus Metrics (Business) ---"
+USERS_REG=$(curl -s "$USER_SVC/metrics" | grep -c "users_registered_total" 2>/dev/null)
+check "$([ "$USERS_REG" -gt 0 ] && echo true)" "Metrics user-service has users_registered_total"
+
+ORDERS_METRIC=$(curl -s "$ORDER_SVC/metrics" | grep -c "orders_created_total" 2>/dev/null)
+check "$([ "$ORDERS_METRIC" -gt 0 ] && echo true)" "Metrics order-service has orders_created_total"
+
+INVENTORY_METRIC=$(curl -s "$PRODUCT_SVC/metrics" | grep -c "inventory_level" 2>/dev/null)
+check "$([ "$INVENTORY_METRIC" -gt 0 ] && echo true)" "Metrics product-service has inventory_level"
+
+NOTIF_METRIC=$(curl -s "$NOTIF_SVC/metrics" | grep -c "notifications_sent_total" 2>/dev/null)
+check "$([ "$NOTIF_METRIC" -gt 0 ] && echo true)" "Metrics notification-service has notifications_sent_total"
+
+# ---- STRUCTURED LOGGING ----
+echo ""
+echo "--- Structured Logging ---"
+sleep 2
+JSON_LOGS=0
+while IFS= read -r line; do
+  # strip docker compose prefix
+  if [[ "$line" == *"|"* ]]; then
+    line="${line#*| }"
+  fi
+  if echo "$line" | jq . >/dev/null 2>&1; then
+    JSON_LOGS=$((JSON_LOGS+1))
+  fi
+done <<< "$(docker compose logs api-gateway 2>&1 | tail -5)"
+check "$([ "$JSON_LOGS" -gt 0 ] && echo true)" "Gateway logs are valid JSON ($JSON_LOGS/5 lines parsed)"
+
+# ---- CORRELATION ID PROPAGATION ----
+echo ""
+echo "--- Correlation ID Propagation ---"
+CID_HEADER=$(curl -s -D- -o /dev/null -H "X-Correlation-ID: verify-cid-123" "$GATEWAY/health" 2>&1 | grep -i "x-correlation-id" | head -1)
+check "$(echo "$CID_HEADER" | grep -q "verify-cid-123" && echo true)" "Correlation ID echoed in response header"
+
+CID_SERVICES=$(docker compose logs 2>&1 | grep "$CORRELATION_ID" | sed -n 's/.*"service":"\([^"]*\)".*/\1/p' | sort -u | wc -l)
+check "$([ "$CID_SERVICES" -ge 3 ] && echo true)" "Correlation ID found in $CID_SERVICES services' logs (expect ≥3)"
+
+# ---- AUTO-GENERATED CORRELATION ID ----
+echo ""
+echo "--- Auto-generated Correlation ID ---"
+AUTO_CID=$(curl -s -D- -o /dev/null "$GATEWAY/health" 2>&1 | grep -i "x-correlation-id" | head -1 | tr -d '\r')
+check "$([ -n "$AUTO_CID" ] && echo true)" "Auto-generated correlation ID when none sent"
+
+# Verify it looks like a UUID (8-4-4-4-12 pattern)
+AUTO_CID_VALUE=$(echo "$AUTO_CID" | sed 's/.*: //')
+UUID_MATCH=$(echo "$AUTO_CID_VALUE" | grep -cE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' 2>/dev/null)
+check "$([ "$UUID_MATCH" -gt 0 ] && echo true)" "Auto-generated correlation ID is a UUID → $AUTO_CID_VALUE"
+
+# ---- RATE LIMITING ----
+# Run this last since it intentionally triggers 429s which could affect other tests
+echo ""
+echo "--- Rate Limiting ---"
+RATE_LIMITED=false
+# Send 300 requests in parallel batches to exceed 100/s
+for batch in $(seq 1 6); do
+  for i in $(seq 1 50); do
+    curl -s -o /dev/null -w "%{http_code}\n" "$GATEWAY/health" &
+  done | grep -q "429" && RATE_LIMITED=true
+  wait
+  if [ "$RATE_LIMITED" = "true" ]; then break; fi
+done
+check "$([ "$RATE_LIMITED" = "true" ] && echo true)" "Rate limiting triggers 429"
+
+# ---- SUMMARY ----
+echo ""
+echo "============================================"
+TOTAL=$((PASS + FAIL))
+echo "  Results: $PASS/$TOTAL passed"
+if [ "$FAIL" -gt 0 ]; then
+  echo -e "  \033[31m$FAIL FAILED\033[0m"
+  exit 1
+else
+  echo -e "  \033[32mALL PASSED\033[0m"
+  exit 0
+fi

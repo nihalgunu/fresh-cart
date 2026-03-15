@@ -9,12 +9,15 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -28,6 +31,48 @@ var db *sql.DB
 var rabbitConn *amqp.Connection
 var rabbitCh *amqp.Channel
 var productServiceURL string
+
+var (
+	httpRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "path", "status"},
+	)
+
+	httpRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "path"},
+	)
+
+	ordersCreatedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "orders_created_total",
+			Help: "Total number of orders created",
+		},
+		[]string{"status"},
+	)
+
+	orderSagaDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "order_saga_duration_seconds",
+			Help:    "Order saga duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(httpRequestsTotal)
+	prometheus.MustRegister(httpRequestDuration)
+	prometheus.MustRegister(ordersCreatedTotal)
+	prometheus.MustRegister(orderSagaDuration)
+}
 
 type Order struct {
 	ID              string      `json:"id"`
@@ -65,6 +110,40 @@ type Product struct {
 	Stock int     `json:"stock"`
 }
 
+type StatusUpdateRequest struct {
+	Status string `json:"status"`
+}
+
+type OrderStatusEvent struct {
+	OrderID        string    `json:"order_id"`
+	UserID         string    `json:"user_id"`
+	Status         string    `json:"status"`
+	PreviousStatus string    `json:"previous_status"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// validTransitions defines the state machine for order status
+var validTransitions = map[string][]string{
+	"pending":          {"confirmed", "failed"},
+	"confirmed":        {"packing", "cancelled"},
+	"packing":          {"out_for_delivery"},
+	"out_for_delivery": {"delivered"},
+	// delivered and failed are terminal states - no transitions allowed
+}
+
+func isValidTransition(from, to string) bool {
+	allowedStates, exists := validTransitions[from]
+	if !exists {
+		return false
+	}
+	for _, state := range allowedStates {
+		if state == to {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -95,7 +174,11 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(correlationIDMiddleware)
 	r.Use(requestLoggingMiddleware)
+	r.Use(metricsMiddleware)
 	r.Use(middleware.Recoverer)
+
+	// Metrics endpoint
+	r.Handle("/metrics", promhttp.Handler())
 
 	r.Get("/health", healthHandler)
 	r.Get("/ready", readyHandler)
@@ -103,6 +186,7 @@ func main() {
 	r.Post("/api/v1/orders", createOrderHandler)
 	r.Get("/api/v1/orders/{id}", getOrderHandler)
 	r.Get("/api/v1/orders/user/{user_id}", listUserOrdersHandler)
+	r.Patch("/api/v1/orders/{id}/status", updateOrderStatusHandler)
 
 	port := getEnv("PORT", "8083")
 	slog.Info("order-service starting", "service", serviceName, "port", port)
@@ -158,6 +242,24 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 			"status", wrapped.statusCode,
 			"duration_ms", duration.Milliseconds(),
 		)
+	})
+}
+
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start).Seconds()
+		httpRequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(wrapped.statusCode)).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration)
 	})
 }
 
@@ -226,6 +328,7 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
+	sagaStart := time.Now()
 
 	var req CreateOrderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -256,6 +359,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 				"reason", "product not found",
 			)
 			releaseReservedStock(ctx, reservedProducts, req.Items)
+			ordersCreatedTotal.WithLabelValues("failed").Inc()
+			orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 			http.Error(w, fmt.Sprintf(`{"error":"product not found: %s"}`, item.ProductID), http.StatusBadRequest)
 			return
 		}
@@ -269,6 +374,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 				"reason", err.Error(),
 			)
 			releaseReservedStock(ctx, reservedProducts, req.Items)
+			ordersCreatedTotal.WithLabelValues("failed").Inc()
+			orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 			http.Error(w, fmt.Sprintf(`{"error":"insufficient stock for product: %s"}`, product.Name), http.StatusConflict)
 			return
 		}
@@ -307,6 +414,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 			"reason", "database transaction failed",
 		)
 		releaseReservedStock(ctx, reservedProducts, req.Items)
+		ordersCreatedTotal.WithLabelValues("failed").Inc()
+		orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -324,6 +433,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 			"reason", "failed to create order record",
 		)
 		releaseReservedStock(ctx, reservedProducts, req.Items)
+		ordersCreatedTotal.WithLabelValues("failed").Inc()
+		orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 		http.Error(w, `{"error":"failed to create order"}`, http.StatusInternalServerError)
 		return
 	}
@@ -343,6 +454,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 				"reason", "failed to create order items",
 			)
 			releaseReservedStock(ctx, reservedProducts, req.Items)
+			ordersCreatedTotal.WithLabelValues("failed").Inc()
+			orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 			http.Error(w, `{"error":"failed to create order items"}`, http.StatusInternalServerError)
 			return
 		}
@@ -357,6 +470,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 			"reason", "failed to commit transaction",
 		)
 		releaseReservedStock(ctx, reservedProducts, req.Items)
+		ordersCreatedTotal.WithLabelValues("failed").Inc()
+		orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 		http.Error(w, `{"error":"failed to commit order"}`, http.StatusInternalServerError)
 		return
 	}
@@ -373,6 +488,10 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	publishOrderConfirmed(ctx, order)
+
+	// Record successful order metrics
+	ordersCreatedTotal.WithLabelValues("confirmed").Inc()
+	orderSagaDuration.Observe(time.Since(sagaStart).Seconds())
 
 	slog.Info("order confirmed",
 		"service", serviceName,
@@ -546,6 +665,192 @@ func listUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(orders)
+}
+
+func updateOrderStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	correlationID := getCorrelationID(ctx)
+
+	id := chi.URLParam(r, "id")
+	if _, err := uuid.Parse(id); err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
+
+	var req StatusUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Get current order status
+	var currentStatus string
+	var userID string
+	err := db.QueryRow(`SELECT status, user_id FROM orders WHERE id = $1`, id).Scan(&currentStatus, &userID)
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"order not found"}`, http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"database error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Validate transition
+	if !isValidTransition(currentStatus, req.Status) {
+		slog.Warn("invalid status transition",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", id,
+			"from", currentStatus,
+			"to", req.Status,
+		)
+		http.Error(w, fmt.Sprintf(`{"error":"invalid status transition from %s to %s"}`, currentStatus, req.Status), http.StatusBadRequest)
+		return
+	}
+
+	// Handle cancellation - release stock before updating status
+	if req.Status == "cancelled" {
+		if err := releaseStockForOrder(ctx, id); err != nil {
+			slog.Error("failed to release stock for cancelled order",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"order_id", id,
+				"error", err.Error(),
+			)
+			http.Error(w, `{"error":"failed to release stock"}`, http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Update status in database
+	_, err = db.Exec(`UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2`, req.Status, id)
+	if err != nil {
+		http.Error(w, `{"error":"failed to update status"}`, http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("order status changed",
+		"service", serviceName,
+		"correlation_id", correlationID,
+		"order_id", id,
+		"from", currentStatus,
+		"to", req.Status,
+	)
+
+	// Publish event
+	event := OrderStatusEvent{
+		OrderID:        id,
+		UserID:         userID,
+		Status:         req.Status,
+		PreviousStatus: currentStatus,
+		UpdatedAt:      time.Now(),
+	}
+	publishOrderEvent(ctx, event)
+
+	// Return updated order with items
+	var order Order
+	err = db.QueryRow(
+		`SELECT id, user_id, status, total_amount, delivery_address, created_at FROM orders WHERE id = $1`,
+		id,
+	).Scan(&order.ID, &order.UserID, &order.Status, &order.TotalAmount, &order.DeliveryAddress, &order.CreatedAt)
+	if err != nil {
+		http.Error(w, `{"error":"failed to fetch updated order"}`, http.StatusInternalServerError)
+		return
+	}
+
+	rows, _ := db.Query(`SELECT id, product_id, product_name, quantity, unit_price FROM order_items WHERE order_id = $1`, id)
+	defer rows.Close()
+	for rows.Next() {
+		var item OrderItem
+		rows.Scan(&item.ID, &item.ProductID, &item.ProductName, &item.Quantity, &item.UnitPrice)
+		order.Items = append(order.Items, item)
+	}
+
+	json.NewEncoder(w).Encode(order)
+}
+
+func releaseStockForOrder(ctx context.Context, orderID string) error {
+	correlationID := getCorrelationID(ctx)
+
+	rows, err := db.Query(`SELECT product_id, quantity FROM order_items WHERE order_id = $1`, orderID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var productID string
+		var quantity int
+		if err := rows.Scan(&productID, &quantity); err != nil {
+			return err
+		}
+
+		slog.Info("releasing stock for cancelled order",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", orderID,
+			"product_id", productID,
+			"quantity", quantity,
+		)
+
+		if err := updateStock(ctx, productID, quantity); err != nil {
+			slog.Error("failed to release stock",
+				"service", serviceName,
+				"correlation_id", correlationID,
+				"order_id", orderID,
+				"product_id", productID,
+				"error", err.Error(),
+			)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func publishOrderEvent(ctx context.Context, event OrderStatusEvent) {
+	correlationID := getCorrelationID(ctx)
+
+	if rabbitCh == nil {
+		slog.Warn("rabbitmq not connected, skipping event publish",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", event.OrderID,
+		)
+		return
+	}
+
+	body, _ := json.Marshal(event)
+	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	routingKey := "order." + event.Status
+
+	err := rabbitCh.PublishWithContext(pubCtx, "orders", routingKey, false, false, amqp.Publishing{
+		ContentType: "application/json",
+		Body:        body,
+		Headers: amqp.Table{
+			"X-Correlation-ID": correlationID,
+		},
+	})
+	if err != nil {
+		slog.Error("event publish failed",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"order_id", event.OrderID,
+			"routing_key", routingKey,
+			"error", err.Error(),
+		)
+	} else {
+		slog.Info("event published",
+			"service", serviceName,
+			"correlation_id", correlationID,
+			"exchange", "orders",
+			"routing_key", routingKey,
+			"order_id", event.OrderID,
+		)
+	}
 }
 
 func getEnv(key, fallback string) string {
