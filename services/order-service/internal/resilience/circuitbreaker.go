@@ -1,3 +1,34 @@
+// Package resilience provides resilience patterns for inter-service communication.
+//
+// This package implements several resilience patterns commonly used in microservices:
+//
+// # Circuit Breaker
+//
+// The circuit breaker pattern prevents cascading failures by failing fast when a
+// downstream service is unhealthy. It transitions through three states:
+//   - Closed: Normal operation, requests flow through
+//   - Open: Service is failing, requests are immediately rejected
+//   - Half-Open: Testing if service has recovered
+//
+// # Retry with Exponential Backoff
+//
+// Automatically retries transient failures with increasing delays between attempts.
+// Includes configurable jitter to prevent thundering herd problems.
+//
+// # Resilient Client
+//
+// Combines circuit breaker, retry, and timeout patterns into a single HTTP client
+// for robust inter-service communication.
+//
+// Example usage:
+//
+//	client := resilience.NewResilientClient(
+//	    "product-service",
+//	    5*time.Second,
+//	    resilience.DefaultConfig(),
+//	    resilience.DefaultRetryConfig(),
+//	)
+//	resp, err := client.Do(ctx, req)
 package resilience
 
 import (
@@ -9,11 +40,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Circuit breaker states
+// Circuit breaker states.
+// The circuit breaker transitions: Closed → Open → Half-Open → Closed.
 const (
-	StateClosed   = 0 // Normal operation
-	StateHalfOpen = 1 // Testing recovery
-	StateOpen     = 2 // Failing, reject fast
+	// StateClosed indicates normal operation - all requests flow through.
+	StateClosed = 0
+	// StateHalfOpen indicates the circuit is testing if the service has recovered.
+	StateHalfOpen = 1
+	// StateOpen indicates the circuit is tripped - requests are immediately rejected.
+	StateOpen = 2
 )
 
 var stateNames = map[int]string{

@@ -1,4 +1,4 @@
-.PHONY: build up down logs seed test-e2e clean boot test-all test-k8s open-grafana trivy chaos loadtest
+.PHONY: build up down logs seed test-e2e clean boot boot-compose test-all test-k8s open-grafana trivy chaos loadtest
 .PHONY: boot-kind boot-images boot-k8s boot-wait boot-down boot-k8s-full health-k8s
 
 build:
@@ -7,10 +7,14 @@ build:
 up:
 	docker compose up -d
 
-boot: build up
+# Docker Compose quick start (build + up + health)
+boot-compose: build up
 	@echo "Waiting for services to be ready..."
 	@sleep 20
 	@$(MAKE) health
+
+# Kubernetes (Kind): create cluster, build images, deploy to K8s
+boot: boot-k8s-full
 
 down:
 	docker compose down

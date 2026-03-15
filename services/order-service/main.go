@@ -1,3 +1,42 @@
+// Package main implements the Order Service for the FreshCart e-commerce platform.
+//
+// The Order Service is the core orchestrator for order processing, implementing:
+//   - Saga pattern for distributed transaction coordination
+//   - Order lifecycle state machine (pending → confirmed → packing → out_for_delivery → delivered)
+//   - Inventory reservation with compensating transactions
+//   - Circuit breaker and retry patterns for resilient inter-service communication
+//   - Bulkhead pattern limiting concurrent saga executions
+//   - RabbitMQ event publishing for downstream services
+//   - Prometheus metrics for order tracking and saga duration
+//
+// Database: PostgreSQL (freshcart_orders)
+//
+// Saga Flow (createOrderHandler):
+//
+//	1. Validate products exist (GET product-service)
+//	2. Reserve inventory (PATCH product-service/stock)
+//	3. Simulate payment (100ms delay)
+//	4. Create order in database (transaction)
+//	5. Publish order.confirmed event
+//	6. On any failure: execute compensating transactions to release stock
+//
+// State Machine Transitions:
+//
+//	pending → confirmed, failed
+//	confirmed → packing, cancelled
+//	packing → out_for_delivery
+//	out_for_delivery → delivered
+//	(delivered and failed are terminal states)
+//
+// Routes:
+//
+//	POST   /api/v1/orders                Create a new order (triggers saga)
+//	GET    /api/v1/orders/{id}           Get order details with items
+//	GET    /api/v1/orders/user/{user_id} List orders for a user
+//	PATCH  /api/v1/orders/{id}/status    Update order status
+//	GET    /health                       Liveness probe
+//	GET    /ready                        Readiness probe
+//	GET    /metrics                      Prometheus metrics
 package main
 
 import (
@@ -29,21 +68,33 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// serviceName is the identifier used for logging, metrics, and tracing.
 const serviceName = "order-service"
 
+// contextKey is a custom type for context keys to avoid collisions.
 type contextKey string
 
+// correlationIDKey stores the unique request identifier for distributed tracing.
 const correlationIDKey contextKey = "correlation_id"
 
-var db *sql.DB
-var rabbitConn *amqp.Connection
-var rabbitCh *amqp.Channel
-var productServiceURL string
-var productServiceClient *resilience.ResilientClient
+// Global dependencies
+var (
+	// db is the PostgreSQL database connection pool.
+	db *sql.DB
+	// rabbitConn is the RabbitMQ connection.
+	rabbitConn *amqp.Connection
+	// rabbitCh is the RabbitMQ channel for publishing events.
+	rabbitCh *amqp.Channel
+	// productServiceURL is the base URL for the product service.
+	productServiceURL string
+	// productServiceClient is a resilient HTTP client with circuit breaker and retry.
+	productServiceClient *resilience.ResilientClient
+)
 
-// Bulkhead: limit concurrent saga executions
+// maxConcurrentSagas limits concurrent saga executions (bulkhead pattern).
 const maxConcurrentSagas = 10
 
+// sagaSemaphore implements the bulkhead pattern by limiting concurrent saga executions.
 var sagaSemaphore = make(chan struct{}, maxConcurrentSagas)
 
 var (
@@ -88,6 +139,7 @@ func init() {
 	prometheus.MustRegister(orderSagaDuration)
 }
 
+// Order represents a customer order with its items.
 type Order struct {
 	ID              string      `json:"id"`
 	UserID          string      `json:"user_id"`
@@ -98,6 +150,7 @@ type Order struct {
 	CreatedAt       time.Time   `json:"created_at"`
 }
 
+// OrderItem represents a line item within an order.
 type OrderItem struct {
 	ID          string  `json:"id"`
 	ProductID   string  `json:"product_id"`
@@ -106,17 +159,20 @@ type OrderItem struct {
 	UnitPrice   float64 `json:"unit_price"`
 }
 
+// CreateOrderRequest contains the data required to create a new order.
 type CreateOrderRequest struct {
 	UserID          string             `json:"user_id"`
 	DeliveryAddress string             `json:"delivery_address"`
 	Items           []OrderItemRequest `json:"items"`
 }
 
+// OrderItemRequest represents a product and quantity to add to an order.
 type OrderItemRequest struct {
 	ProductID string `json:"product_id"`
 	Quantity  int    `json:"quantity"`
 }
 
+// Product represents product data fetched from the product service.
 type Product struct {
 	ID    string  `json:"id"`
 	Name  string  `json:"name"`
@@ -124,10 +180,12 @@ type Product struct {
 	Stock int     `json:"stock"`
 }
 
+// StatusUpdateRequest contains the new status for an order transition.
 type StatusUpdateRequest struct {
 	Status string `json:"status"`
 }
 
+// OrderStatusEvent is published to RabbitMQ when an order status changes.
 type OrderStatusEvent struct {
 	OrderID        string    `json:"order_id"`
 	UserID         string    `json:"user_id"`
@@ -136,7 +194,9 @@ type OrderStatusEvent struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
-// validTransitions defines the state machine for order status
+// validTransitions defines the state machine for order status.
+// Each key maps to a slice of valid target states.
+// Terminal states (delivered, failed) have no outgoing transitions.
 var validTransitions = map[string][]string{
 	"pending":          {"confirmed", "failed"},
 	"confirmed":        {"packing", "cancelled"},
@@ -145,6 +205,7 @@ var validTransitions = map[string][]string{
 	// delivered and failed are terminal states - no transitions allowed
 }
 
+// isValidTransition checks if a status transition is valid according to the state machine.
 func isValidTransition(from, to string) bool {
 	allowedStates, exists := validTransitions[from]
 	if !exists {
@@ -233,6 +294,7 @@ func main() {
 	}
 }
 
+// correlationIDMiddleware ensures every request has a correlation ID for distributed tracing.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := r.Header.Get("X-Correlation-ID")
@@ -246,6 +308,7 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// getCorrelationID retrieves the correlation ID from the context.
 func getCorrelationID(ctx context.Context) string {
 	if id, ok := ctx.Value(correlationIDKey).(string); ok {
 		return id
@@ -253,16 +316,19 @@ func getCorrelationID(ctx context.Context) string {
 	return ""
 }
 
+// responseWriter wraps http.ResponseWriter to capture the status code.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 }
 
+// WriteHeader captures the status code and delegates to the underlying ResponseWriter.
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// requestLoggingMiddleware logs each HTTP request with timing and trace information.
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -291,6 +357,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// metricsMiddleware collects Prometheus metrics for each HTTP request.
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
@@ -309,6 +376,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// migrate creates the orders and order_items tables if they don't exist.
 func migrate() {
 	schema := `
 	CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -335,6 +403,8 @@ func migrate() {
 	slog.Info("migration completed", "service", serviceName)
 }
 
+// connectRabbitMQ establishes a connection to RabbitMQ with retry logic.
+// Declares the "orders" topic exchange for publishing order events.
 func connectRabbitMQ() {
 	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
@@ -358,10 +428,12 @@ func connectRabbitMQ() {
 	slog.Warn("rabbitmq not connected, events won't be published", "service", serviceName)
 }
 
+// healthHandler returns a simple health check response for liveness probes.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
+// readyHandler checks database connectivity for readiness probes.
 func readyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := db.Ping(); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -371,6 +443,12 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
+// createOrderHandler implements the order creation saga.
+// It orchestrates inventory reservation, payment simulation, order creation,
+// and event publishing. On any failure, compensating transactions release reserved stock.
+//
+// The saga is protected by a bulkhead (semaphore) limiting concurrent executions
+// and uses circuit breakers for resilient inter-service communication.
 func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -565,6 +643,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(order)
 }
 
+// getProduct fetches product details from the product service.
+// Uses the resilient client with circuit breaker and retry patterns.
 func getProduct(ctx context.Context, productID string) (*Product, error) {
 	correlationID := getCorrelationID(ctx)
 
@@ -599,6 +679,9 @@ func getProduct(ctx context.Context, productID string) (*Product, error) {
 	return &product, nil
 }
 
+// updateStock adjusts product inventory via the product service.
+// Uses the resilient client with circuit breaker and retry patterns.
+// Positive quantity releases stock, negative quantity reserves stock.
 func updateStock(ctx context.Context, productID string, quantity int) error {
 	correlationID := getCorrelationID(ctx)
 
@@ -637,6 +720,8 @@ func updateStock(ctx context.Context, productID string, quantity int) error {
 	return nil
 }
 
+// releaseReservedStock is a compensating transaction that releases previously reserved stock.
+// Called when the saga fails after inventory reservation to maintain consistency.
 func releaseReservedStock(ctx context.Context, productIDs []string, items []OrderItemRequest) {
 	correlationID := getCorrelationID(ctx)
 
@@ -661,6 +746,9 @@ func releaseReservedStock(ctx context.Context, productIDs []string, items []Orde
 	}
 }
 
+// publishOrderConfirmed publishes an order.confirmed event to RabbitMQ.
+// The event is consumed by the notification service to send confirmation messages.
+// Includes OpenTelemetry trace context propagation for distributed tracing.
 func publishOrderConfirmed(ctx context.Context, order Order) {
 	correlationID := getCorrelationID(ctx)
 
@@ -719,6 +807,8 @@ func publishOrderConfirmed(ctx context.Context, order Order) {
 	}
 }
 
+// getOrderHandler retrieves an order by ID including all order items.
+// Returns HTTP 400 for invalid UUIDs, HTTP 404 if order not found.
 func getOrderHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if _, err := uuid.Parse(id); err != nil {
@@ -747,6 +837,8 @@ func getOrderHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(order)
 }
 
+// listUserOrdersHandler returns all orders for a specific user, ordered by creation date (newest first).
+// Returns HTTP 400 for invalid UUIDs.
 func listUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
 	if _, err := uuid.Parse(userID); err != nil {
@@ -771,6 +863,10 @@ func listUserOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(orders)
 }
 
+// updateOrderStatusHandler transitions an order to a new status.
+// Validates the transition against the state machine.
+// For cancellation, releases reserved inventory before updating status.
+// Publishes a status event to RabbitMQ for downstream services.
 func updateOrderStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -874,6 +970,8 @@ func updateOrderStatusHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(order)
 }
 
+// releaseStockForOrder releases all reserved stock for a cancelled order.
+// Iterates through order items and releases inventory for each product.
 func releaseStockForOrder(ctx context.Context, orderID string) error {
 	correlationID := getCorrelationID(ctx)
 
@@ -913,6 +1011,9 @@ func releaseStockForOrder(ctx context.Context, orderID string) error {
 	return nil
 }
 
+// publishOrderEvent publishes an order status change event to RabbitMQ.
+// The routing key is based on the new status (e.g., "order.packing", "order.delivered").
+// Includes OpenTelemetry trace context propagation for distributed tracing.
 func publishOrderEvent(ctx context.Context, event OrderStatusEvent) {
 	correlationID := getCorrelationID(ctx)
 
@@ -974,6 +1075,7 @@ func publishOrderEvent(ctx context.Context, event OrderStatusEvent) {
 	}
 }
 
+// getEnv retrieves an environment variable value or returns the fallback if not set.
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

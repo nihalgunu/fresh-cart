@@ -9,6 +9,10 @@
 
 ## Quick Start (Docker Compose)
 ```bash
+# Option A: one command (build + up + health)
+make boot-compose
+
+# Option B: step by step
 # Build all services
 make build
 

@@ -1,3 +1,25 @@
+// Package main implements the Notification Service for the FreshCart e-commerce platform.
+//
+// The Notification Service is an event-driven service that:
+//   - Consumes order events from RabbitMQ (order.confirmed, order.packing, order.out_for_delivery, order.delivered, order.cancelled)
+//   - Stores notifications in MongoDB for user retrieval
+//   - Simulates email delivery via templated messages
+//   - Implements Dead Letter Queue for failed message handling
+//   - Provides OpenTelemetry tracing for async message processing
+//   - Collects Prometheus metrics for notification tracking
+//
+// Database: MongoDB (freshcart_notifications)
+//
+// Routes:
+//
+//	GET    /api/v1/notifications/user/{user_id}  List notifications for a user
+//	GET    /health                               Liveness probe
+//	GET    /ready                                Readiness probe
+//	GET    /metrics                              Prometheus metrics
+//
+// Async Consumers:
+//
+//	notifications.order - Subscribes to order.* events from the "orders" topic exchange
 package main
 
 import (
@@ -27,14 +49,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// serviceName is the identifier used for logging, metrics, and tracing.
 const serviceName = "notification-service"
 
+// contextKey is a custom type for context keys to avoid collisions.
 type contextKey string
 
+// correlationIDKey stores the unique request identifier for distributed tracing.
 const correlationIDKey contextKey = "correlation_id"
 
-var mongoClient *mongo.Client
-var notificationsCollection *mongo.Collection
+// Global dependencies
+var (
+	// mongoClient is the MongoDB client connection.
+	mongoClient *mongo.Client
+	// notificationsCollection is the MongoDB collection for storing notifications.
+	notificationsCollection *mongo.Collection
+)
 
 var (
 	httpRequestsTotal = prometheus.NewCounterVec(
@@ -69,6 +99,7 @@ func init() {
 	prometheus.MustRegister(notificationsSentTotal)
 }
 
+// Notification represents a user notification stored in MongoDB.
 type Notification struct {
 	ID        string    `json:"id" bson:"_id,omitempty"`
 	OrderID   string    `json:"order_id" bson:"order_id"`
@@ -79,7 +110,7 @@ type Notification struct {
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 }
 
-// OrderEvent for order creation (order.confirmed from saga)
+// OrderEvent represents an order creation event from the saga (order.confirmed).
 type OrderEvent struct {
 	ID              string  `json:"id"`
 	UserID          string  `json:"user_id"`
@@ -88,7 +119,7 @@ type OrderEvent struct {
 	DeliveryAddress string  `json:"delivery_address"`
 }
 
-// OrderStatusEvent for status transitions
+// OrderStatusEvent represents an order status transition event.
 type OrderStatusEvent struct {
 	OrderID        string `json:"order_id"`
 	UserID         string `json:"user_id"`
@@ -97,6 +128,8 @@ type OrderStatusEvent struct {
 	UpdatedAt      string `json:"updated_at"`
 }
 
+// notificationMessages maps routing keys to user-friendly message templates.
+// The %s placeholder is replaced with the order ID.
 var notificationMessages = map[string]string{
 	"order.confirmed":        "Your order %s has been confirmed!",
 	"order.packing":          "Your order %s is being packed!",
@@ -150,6 +183,7 @@ func main() {
 	}
 }
 
+// correlationIDMiddleware ensures every request has a correlation ID for distributed tracing.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := r.Header.Get("X-Correlation-ID")
@@ -163,6 +197,7 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// getCorrelationID retrieves the correlation ID from the context.
 func getCorrelationID(ctx context.Context) string {
 	if id, ok := ctx.Value(correlationIDKey).(string); ok {
 		return id
@@ -170,16 +205,19 @@ func getCorrelationID(ctx context.Context) string {
 	return ""
 }
 
+// responseWriter wraps http.ResponseWriter to capture the status code.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 }
 
+// WriteHeader captures the status code and delegates to the underlying ResponseWriter.
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// requestLoggingMiddleware logs each HTTP request with timing and trace information.
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -208,6 +246,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// metricsMiddleware collects Prometheus metrics for each HTTP request.
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
@@ -226,6 +265,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// connectMongoDB establishes a connection to MongoDB with retry logic.
 func connectMongoDB() {
 	mongoURI := getEnv("MONGODB_URI", "mongodb://localhost:27017")
 	dbName := getEnv("MONGODB_DATABASE", "freshcart_notifications")
@@ -249,6 +289,10 @@ func connectMongoDB() {
 	slog.Info("mongodb connected", "service", serviceName)
 }
 
+// startRabbitMQConsumer starts the RabbitMQ consumer for order events.
+// It subscribes to the "orders" topic exchange with routing keys for all order status events.
+// Implements automatic reconnection, Dead Letter Queue for failed messages,
+// and OpenTelemetry trace context propagation.
 func startRabbitMQConsumer() {
 	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 	queueName := "notifications.order"
@@ -503,10 +547,12 @@ func startRabbitMQConsumer() {
 	}
 }
 
+// healthHandler returns a simple health check response for liveness probes.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
+// readyHandler checks MongoDB connectivity for readiness probes.
 func readyHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -519,6 +565,8 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
+// listUserNotificationsHandler returns all notifications for a specific user.
+// Results are sorted by creation date (newest first).
 func listUserNotificationsHandler(w http.ResponseWriter, r *http.Request) {
 	userID := chi.URLParam(r, "user_id")
 
@@ -545,6 +593,7 @@ func listUserNotificationsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(notifications)
 }
 
+// getEnv retrieves an environment variable value or returns the fallback if not set.
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

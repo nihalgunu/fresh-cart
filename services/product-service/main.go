@@ -1,3 +1,30 @@
+// Package main implements the Product Service for the FreshCart e-commerce platform.
+//
+// The Product Service manages the product catalog and inventory, providing:
+//   - Product CRUD operations (create, read, list)
+//   - Advanced search with filtering (price range, category, stock status)
+//   - Stock management and reservation for orders
+//   - RabbitMQ consumer for async inventory updates
+//   - Dead Letter Queue (DLQ) for failed message handling
+//   - Prometheus metrics for inventory tracking
+//   - OpenTelemetry tracing for async message processing
+//
+// Database: PostgreSQL (freshcart_products)
+//
+// Routes:
+//
+//	GET    /api/v1/products            List all products
+//	GET    /api/v1/products/search     Search with filters (q, category, min_price, max_price, in_stock)
+//	GET    /api/v1/products/{id}       Get product by ID
+//	POST   /api/v1/products            Create a new product
+//	PATCH  /api/v1/products/{id}/stock Update stock (reserve/release inventory)
+//	GET    /health                     Liveness probe
+//	GET    /ready                      Readiness probe
+//	GET    /metrics                    Prometheus metrics
+//
+// Async Consumers:
+//
+//	inventory.update - Processes stock adjustments from other services
 package main
 
 import (
@@ -25,12 +52,16 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// serviceName is the identifier used for logging, metrics, and tracing.
 const serviceName = "product-service"
 
+// contextKey is a custom type for context keys to avoid collisions.
 type contextKey string
 
+// correlationIDKey stores the unique request identifier for distributed tracing.
 const correlationIDKey contextKey = "correlation_id"
 
+// db is the PostgreSQL database connection pool.
 var db *sql.DB
 
 var (
@@ -75,6 +106,7 @@ func init() {
 	prometheus.MustRegister(inventoryUpdatesTotal)
 }
 
+// Product represents a product in the catalog.
 type Product struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
@@ -86,6 +118,7 @@ type Product struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+// CreateProductRequest contains the data required to create a new product.
 type CreateProductRequest struct {
 	Name        string  `json:"name"`
 	Description string  `json:"description"`
@@ -95,6 +128,8 @@ type CreateProductRequest struct {
 	ImageURL    string  `json:"image_url"`
 }
 
+// StockUpdateRequest contains the quantity change for stock operations.
+// Positive values add stock, negative values reserve/remove stock.
 type StockUpdateRequest struct {
 	Quantity int `json:"quantity"`
 }
@@ -170,6 +205,8 @@ func main() {
 	}
 }
 
+// initInventoryMetrics initializes Prometheus inventory gauges from existing products.
+// Called at startup to ensure metrics reflect current inventory levels.
 func initInventoryMetrics() {
 	rows, err := db.Query(`SELECT id, stock FROM products`)
 	if err != nil {
@@ -188,6 +225,7 @@ func initInventoryMetrics() {
 	}
 }
 
+// correlationIDMiddleware ensures every request has a correlation ID for distributed tracing.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := r.Header.Get("X-Correlation-ID")
@@ -201,6 +239,7 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// getCorrelationID retrieves the correlation ID from the context.
 func getCorrelationID(ctx context.Context) string {
 	if id, ok := ctx.Value(correlationIDKey).(string); ok {
 		return id
@@ -208,16 +247,19 @@ func getCorrelationID(ctx context.Context) string {
 	return ""
 }
 
+// responseWriter wraps http.ResponseWriter to capture the status code.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 }
 
+// WriteHeader captures the status code and delegates to the underlying ResponseWriter.
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// requestLoggingMiddleware logs each HTTP request with timing and trace information.
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -246,6 +288,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// metricsMiddleware collects Prometheus metrics for each HTTP request.
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
@@ -264,6 +307,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// migrate creates the products table if it doesn't exist.
 func migrate() {
 	schema := `
 	CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -284,6 +328,18 @@ func migrate() {
 	slog.Info("migration completed", "service", serviceName)
 }
 
+// startRabbitMQConsumer starts the RabbitMQ consumer for inventory update messages.
+// It implements automatic reconnection, Dead Letter Queue for failed messages,
+// and OpenTelemetry trace context propagation.
+//
+// Message format expected:
+//
+//	{
+//	  "product_id": "uuid",
+//	  "quantity_change": int,
+//	  "order_id": "uuid",
+//	  "action": "reserve|release"
+//	}
 func startRabbitMQConsumer() {
 	rabbitURL := getEnv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 	queueName := "inventory.update"
@@ -458,10 +514,12 @@ func startRabbitMQConsumer() {
 	}
 }
 
+// healthHandler returns a simple health check response for liveness probes.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
+// readyHandler checks database connectivity for readiness probes.
 func readyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := db.Ping(); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -471,6 +529,7 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
+// listProductsHandler returns all products ordered by creation date (newest first).
 func listProductsHandler(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query(`SELECT id, name, description, price, category, stock, image_url, created_at FROM products ORDER BY created_at DESC`)
 	if err != nil {
@@ -491,6 +550,13 @@ func listProductsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(products)
 }
 
+// searchProductsHandler searches products with optional filters.
+// Query parameters:
+//   - q: Text search in name and description
+//   - category: Filter by exact category match
+//   - min_price: Minimum price filter
+//   - max_price: Maximum price filter
+//   - in_stock: Set to "true" to only return products with stock > 0
 func searchProductsHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -575,6 +641,8 @@ func searchProductsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(products)
 }
 
+// getProductHandler retrieves a single product by ID.
+// Returns HTTP 400 for invalid UUIDs, HTTP 404 if product not found.
 func getProductHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if _, err := uuid.Parse(id); err != nil {
@@ -593,6 +661,8 @@ func getProductHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(p)
 }
 
+// createProductHandler creates a new product in the catalog.
+// Initializes inventory metrics for the new product.
 func createProductHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -634,6 +704,10 @@ func createProductHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(p)
 }
 
+// updateStockHandler adjusts the stock level for a product.
+// Positive quantity adds stock, negative quantity reserves/removes stock.
+// Returns HTTP 404 if product not found, HTTP 409 if insufficient stock.
+// Updates Prometheus inventory metrics on successful operation.
 func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -703,6 +777,7 @@ func updateStockHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(p)
 }
 
+// getEnv retrieves an environment variable value or returns the fallback if not set.
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

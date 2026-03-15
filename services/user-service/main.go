@@ -1,3 +1,22 @@
+// Package main implements the User Service for the FreshCart e-commerce platform.
+//
+// The User Service handles all user-related operations including:
+//   - User registration with bcrypt password hashing
+//   - User authentication with JWT token generation (24-hour expiry)
+//   - User profile management and retrieval
+//   - Correlation ID tracking for distributed tracing
+//   - Prometheus metrics for user registration tracking
+//
+// Database: PostgreSQL (freshcart_users)
+//
+// Routes:
+//
+//	POST   /api/v1/auth/register    Register a new user
+//	POST   /api/v1/auth/login       Authenticate and get JWT token
+//	GET    /api/v1/users/{id}       Get user profile by ID
+//	GET    /health                  Liveness probe
+//	GET    /ready                   Readiness probe
+//	GET    /metrics                 Prometheus metrics
 package main
 
 import (
@@ -24,14 +43,22 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// serviceName is the identifier used for logging, metrics, and tracing.
 const serviceName = "user-service"
 
+// contextKey is a custom type for context keys to avoid collisions.
 type contextKey string
 
+// correlationIDKey stores the unique request identifier for distributed tracing.
 const correlationIDKey contextKey = "correlation_id"
 
-var db *sql.DB
-var jwtSecret []byte
+// Global dependencies
+var (
+	// db is the PostgreSQL database connection pool.
+	db *sql.DB
+	// jwtSecret is the signing key for JWT tokens.
+	jwtSecret []byte
+)
 
 var (
 	httpRequestsTotal = prometheus.NewCounterVec(
@@ -65,6 +92,8 @@ func init() {
 	prometheus.MustRegister(usersRegisteredTotal)
 }
 
+// User represents a registered user in the system.
+// Password hash is excluded from JSON serialization for security.
 type User struct {
 	ID              string    `json:"id"`
 	Email           string    `json:"email"`
@@ -73,6 +102,7 @@ type User struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+// RegisterRequest contains the data required to create a new user account.
 type RegisterRequest struct {
 	Email           string `json:"email"`
 	Password        string `json:"password"`
@@ -80,11 +110,14 @@ type RegisterRequest struct {
 	DeliveryAddress string `json:"delivery_address"`
 }
 
+// LoginRequest contains credentials for user authentication.
 type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
 
+// AuthResponse is returned after successful registration or login.
+// Contains user details and a JWT token for subsequent authenticated requests.
 type AuthResponse struct {
 	ID    string `json:"id"`
 	Email string `json:"email"`
@@ -157,6 +190,7 @@ func main() {
 	}
 }
 
+// correlationIDMiddleware ensures every request has a correlation ID for distributed tracing.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := r.Header.Get("X-Correlation-ID")
@@ -170,6 +204,7 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// getCorrelationID retrieves the correlation ID from the context.
 func getCorrelationID(ctx context.Context) string {
 	if id, ok := ctx.Value(correlationIDKey).(string); ok {
 		return id
@@ -177,16 +212,19 @@ func getCorrelationID(ctx context.Context) string {
 	return ""
 }
 
+// responseWriter wraps http.ResponseWriter to capture the status code.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 }
 
+// WriteHeader captures the status code and delegates to the underlying ResponseWriter.
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// requestLoggingMiddleware logs each HTTP request with timing and trace information.
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -215,6 +253,7 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// metricsMiddleware collects Prometheus metrics for each HTTP request.
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
@@ -233,6 +272,8 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// migrate creates the users table if it doesn't exist.
+// Uses PostgreSQL's pgcrypto extension for UUID generation.
 func migrate() {
 	schema := `
 	CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -251,10 +292,13 @@ func migrate() {
 	slog.Info("migration completed", "service", serviceName)
 }
 
+// healthHandler returns a simple health check response for liveness probes.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
+// readyHandler checks database connectivity for readiness probes.
+// Returns HTTP 503 if the database is unreachable.
 func readyHandler(w http.ResponseWriter, r *http.Request) {
 	if err := db.Ping(); err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -264,6 +308,10 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ready", "service": serviceName})
 }
 
+// registerHandler creates a new user account.
+// It hashes the password using bcrypt, stores the user in the database,
+// and returns a JWT token for immediate authentication.
+// Returns HTTP 409 Conflict if the email already exists.
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -312,6 +360,10 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(AuthResponse{ID: id, Email: req.Email, Name: req.Name, Token: token})
 }
 
+// loginHandler authenticates a user and returns a JWT token.
+// It verifies the password against the stored bcrypt hash and generates
+// a new JWT token valid for 24 hours.
+// Returns HTTP 401 Unauthorized for invalid credentials.
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	correlationID := getCorrelationID(ctx)
@@ -358,6 +410,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(AuthResponse{ID: id, Email: req.Email, Name: name, Token: token})
 }
 
+// getUserHandler retrieves a user profile by ID.
+// Returns HTTP 400 for invalid UUIDs, HTTP 404 if user not found.
 func getUserHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if _, err := uuid.Parse(id); err != nil {
@@ -376,6 +430,8 @@ func getUserHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(user)
 }
 
+// generateToken creates a signed JWT token for the given user.
+// The token contains the user ID (sub), email, and expires after 24 hours.
 func generateToken(userID, email string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub":   userID,
@@ -387,6 +443,7 @@ func generateToken(userID, email string) string {
 	return signed
 }
 
+// getEnv retrieves an environment variable value or returns the fallback if not set.
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

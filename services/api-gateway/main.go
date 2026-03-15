@@ -1,3 +1,27 @@
+// Package main implements the API Gateway service for the FreshCart e-commerce platform.
+//
+// The API Gateway serves as the single entry point for all client requests, providing:
+//   - JWT-based authentication and authorization
+//   - Redis-backed rate limiting using sliding window algorithm
+//   - Reverse proxy routing to downstream microservices
+//   - Correlation ID generation and propagation for distributed tracing
+//   - OpenTelemetry instrumentation for observability
+//   - Prometheus metrics collection
+//
+// Architecture:
+//
+//	Client → API Gateway → [user-service, product-service, order-service, notification-service]
+//
+// Routes:
+//
+//	POST   /api/v1/auth/register       (public)
+//	POST   /api/v1/auth/login          (public)
+//	GET    /api/v1/users/*             (protected)
+//	GET    /api/v1/products/*          (protected)
+//	GET    /api/v1/orders/*            (protected)
+//	GET    /api/v1/notifications/*     (protected)
+//	GET    /metrics                    (Prometheus endpoint)
+//	GET    /health, /ready             (liveness/readiness probes)
 package main
 
 import (
@@ -28,19 +52,27 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// serviceName is the identifier used for logging, metrics, and tracing.
 const serviceName = "api-gateway"
 
+// contextKey is a custom type for context keys to avoid collisions.
 type contextKey string
 
+// Context keys for storing request-scoped values.
 const (
+	// correlationIDKey stores the unique request identifier for distributed tracing.
 	correlationIDKey contextKey = "correlation_id"
-	userIDKey        contextKey = "user_id"
-	userEmailKey     contextKey = "user_email"
+	// userIDKey stores the authenticated user's ID extracted from JWT.
+	userIDKey contextKey = "user_id"
+	// userEmailKey stores the authenticated user's email extracted from JWT.
+	userEmailKey contextKey = "user_email"
 )
 
 var (
+	// redisClient is the global Redis client used for rate limiting.
 	redisClient *redis.Client
 
+	// httpRequestsTotal counts total HTTP requests by method, path, and status code.
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
@@ -49,6 +81,7 @@ var (
 		[]string{"method", "path", "status"},
 	)
 
+	// httpRequestDuration measures HTTP request latency in seconds.
 	httpRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
@@ -151,11 +184,16 @@ func main() {
 	}
 }
 
+// healthHandler returns a simple health check response for liveness probes.
+// It always returns HTTP 200 with {"status": "ok"} if the service is running.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": serviceName})
 }
 
+// readyHandler checks if the service and its dependencies are ready to accept traffic.
+// It verifies Redis connectivity and returns HTTP 503 if Redis is unavailable.
+// Used by Kubernetes readiness probes to determine if traffic should be routed to this instance.
 func readyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -182,6 +220,15 @@ func readyHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// rateLimitMiddleware creates a rate limiting middleware using Redis-backed sliding window algorithm.
+// It limits requests per client IP based on the configured requests per second (rps) and burst parameters.
+// If Redis is unavailable, requests are allowed through (fail-open behavior).
+//
+// Parameters:
+//   - rps: Maximum requests per second per client
+//   - burst: Maximum burst size allowed within a 1-second window
+//
+// Returns HTTP 429 Too Many Requests when rate limit is exceeded.
 func rateLimitMiddleware(rps, burst int) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +286,9 @@ func rateLimitMiddleware(rps, burst int) func(http.Handler) http.Handler {
 	}
 }
 
+// getClientIP extracts the client IP address from the request.
+// It first checks the X-Forwarded-For header (for requests behind a proxy/load balancer),
+// then falls back to the RemoteAddr field. The port is stripped from the result.
 func getClientIP(r *http.Request) string {
 	// Check X-Forwarded-For header first
 	xff := r.Header.Get("X-Forwarded-For")
@@ -257,6 +307,10 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
+// authMiddleware validates JWT tokens in the Authorization header and extracts user claims.
+// It expects a Bearer token and validates the signature using HS256 algorithm.
+// On successful validation, user ID and email are stored in the request context.
+// Returns HTTP 401 Unauthorized for missing, invalid, or expired tokens.
 func authMiddleware(next http.Handler) http.Handler {
 	jwtSecret := []byte(getEnv("JWT_SECRET", "freshcart-dev-secret"))
 
@@ -368,6 +422,9 @@ func authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// correlationIDMiddleware ensures every request has a unique correlation ID for distributed tracing.
+// If X-Correlation-ID header is present, it's used; otherwise, a new UUID is generated.
+// The correlation ID is stored in the request context and returned in the response header.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := r.Header.Get("X-Correlation-ID")
@@ -381,6 +438,8 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// getCorrelationID retrieves the correlation ID from the context.
+// Returns an empty string if no correlation ID is found.
 func getCorrelationID(ctx context.Context) string {
 	if id, ok := ctx.Value(correlationIDKey).(string); ok {
 		return id
@@ -388,16 +447,20 @@ func getCorrelationID(ctx context.Context) string {
 	return ""
 }
 
+// responseWriter wraps http.ResponseWriter to capture the status code for logging and metrics.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 }
 
+// WriteHeader captures the status code and delegates to the underlying ResponseWriter.
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// requestLoggingMiddleware logs each HTTP request with timing, status, and trace information.
+// Logs are structured JSON format including correlation ID, trace ID, method, path, status, and duration.
 func requestLoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -426,6 +489,9 @@ func requestLoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// metricsMiddleware collects Prometheus metrics for each HTTP request.
+// It records request count (by method, path, status) and request duration.
+// The /metrics endpoint itself is excluded from metrics collection.
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip metrics endpoint itself
@@ -445,6 +511,18 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// proxyHandler creates a reverse proxy handler for routing requests to a downstream service.
+// It handles:
+//   - URL path rewriting (strips and replaces prefix)
+//   - Correlation ID forwarding
+//   - OpenTelemetry trace context propagation
+//   - Timeout and connection pooling configuration
+//   - Error handling for upstream failures (returns 502 Bad Gateway)
+//
+// Parameters:
+//   - targetURL: The base URL of the downstream service (e.g., "http://localhost:8081")
+//   - prefix: The path prefix to mount and rewrite (e.g., "/api/v1/users")
+//   - targetService: The name of the target service for logging
 func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 	target, err := url.Parse(targetURL)
 	if err != nil {
@@ -509,6 +587,7 @@ func proxyHandler(targetURL, prefix, targetService string) http.Handler {
 	}))
 }
 
+// getEnv retrieves an environment variable value or returns the fallback if not set.
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

@@ -1,3 +1,5 @@
+// This file contains the ResilientClient which combines circuit breaker,
+// retry, and timeout patterns for robust inter-service HTTP communication.
 package resilience
 
 import (

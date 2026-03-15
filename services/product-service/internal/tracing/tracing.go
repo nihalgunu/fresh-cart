@@ -1,3 +1,11 @@
+// Package tracing provides OpenTelemetry tracer initialization for distributed tracing.
+//
+// This package sets up the OpenTelemetry SDK with OTLP/HTTP exporter to send traces
+// to a Jaeger-compatible backend.
+//
+// Environment Variables:
+//
+//	OTEL_EXPORTER_OTLP_ENDPOINT - The OTLP endpoint (default: http://localhost:4318)
 package tracing
 
 import (
@@ -13,6 +21,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
 
+// InitTracer initializes the OpenTelemetry tracer for the given service.
+// Returns a shutdown function that should be called on application termination.
 func InitTracer(serviceName string) (func(context.Context) error, error) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
@@ -46,6 +56,7 @@ func InitTracer(serviceName string) (func(context.Context) error, error) {
 	return tp.Shutdown, nil
 }
 
+// extractHost removes the http:// or https:// prefix from the endpoint URL.
 func extractHost(endpoint string) string {
 	// Remove http:// or https:// prefix for otlptracehttp
 	host := endpoint

@@ -1,3 +1,5 @@
+// This file contains the retry logic with exponential backoff and jitter.
+// It provides configurable retry behavior for transient failures.
 package resilience
 
 import (
@@ -9,12 +11,19 @@ import (
 	"time"
 )
 
-// RetryConfig holds the configuration for retry logic
+// RetryConfig holds the configuration for retry logic.
+//
+// The delay between retries follows exponential backoff:
+// delay = min(InitialDelay * 2^attempt + random(0, MaxJitter), MaxDelay)
 type RetryConfig struct {
-	MaxRetries   int           // Maximum number of retries
-	InitialDelay time.Duration // Initial delay between retries
-	MaxDelay     time.Duration // Maximum delay between retries
-	MaxJitter    time.Duration // Maximum random jitter added to each delay
+	// MaxRetries is the maximum number of retry attempts (0 = no retries).
+	MaxRetries int
+	// InitialDelay is the delay before the first retry.
+	InitialDelay time.Duration
+	// MaxDelay is the maximum delay between retries (caps exponential growth).
+	MaxDelay time.Duration
+	// MaxJitter is the maximum random jitter added to prevent thundering herd.
+	MaxJitter time.Duration
 }
 
 // DefaultRetryConfig returns the default retry configuration
